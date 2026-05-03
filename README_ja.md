@@ -2,7 +2,7 @@
 
 **楽器を問わない自動採譜モデル** — Neural Semi-CRF ベース
 
-[English README](README.md)
+[English README](README.md) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/instrument-agnostic-amt/blob/main/Colab_Inference.ipynb)
 
 ---
 

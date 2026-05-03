@@ -2,7 +2,7 @@
 
 **Transcribe any instrument to MIDI** — Neural Semi-CRF based AMT
 
-[日本語版 README はこちら](README_ja.md)
+[日本語版 README はこちら](README_ja.md) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/instrument-agnostic-amt/blob/main/Colab_Inference.ipynb)
 
 ---
 
