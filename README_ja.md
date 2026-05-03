@@ -8,7 +8,7 @@
 
 ## 概要
 
-このプロジェクトは、音声ファイルから MIDI を生成する**楽器非依存の自動採譜 (AMT)** モデルです。
+このプロジェクトは、オーディオファイルから MIDI を生成する**楽器非依存の自動採譜 (AMT)** モデルです。
 [Basic Pitch](https://github.com/spotify/basic-pitch) と同じように、楽器の種類を区別せず、ピアノでもギターでもボーカルでも音高があればひとつのモデルでまとめて採譜します。
 
 アーキテクチャは [**Transkun**](https://github.com/Yujia-Yan/Transkun)（Yujia Yan 氏）の Neural Semi-CRF がベースです。
@@ -31,7 +31,7 @@
 ## アーキテクチャ
 
 ```
-音声波形 [B, 2, T]
+オーディオ波形 [B, 2, T]
         │
         ▼
 ┌─────────────────────────────┐
@@ -98,7 +98,7 @@
 ```
 instrument_agnostic_amt/
 ├── train.py                    # 学習ループ（AMP、W&B、ウォームアップ対応）
-├── infer.py                    # 推論: 音声 → MIDI
+├── infer.py                    # 推論: オーディオ → MIDI
 ├── dataset.py                  # StemDataset（ステムの混ぜ合わせ等のオーグメンテーション）
 ├── losses.py                   # ロス計算: Semi-CRF NLL + 境界 + 楽器分類
 ├── augmentation.py             # AudioAugmentor（EQ、ピッチシフト、リバーブ、ノイズ等）
@@ -118,7 +118,7 @@ instrument_agnostic_amt/
 │   └── spec_augment.py         # SpecAugment & MiniBatch Mixture Masking
 │
 └── preprocess/
-    ├── prepare_dataset.py      # 音声/MIDI ペアから manifest.csv を生成
+    ├── prepare_dataset.py      # オーディオ/MIDI ペアから manifest.csv を生成
     ├── resample_only.py        # まとめてリサンプリング
     └── apply_ir_augmentation.py # IR コンボリューションでリバーブ付きステムを事前生成
 ```
@@ -154,10 +154,10 @@ pip install -r requirements.txt
 
 ### 1. ファイルの配置
 
-ステム音声と対応する MIDI ファイルを以下のように配置します:
+ステムオーディオと対応する MIDI ファイルを以下のように配置します:
 
 ```
-stems/          # 音声ファイル (.wav / .flac)
+stems/          # オーディオファイル (.wav / .flac)
   ├── song1__piano.wav
   ├── song1__guitar.wav
   ├── song2__vocal.wav
@@ -190,7 +190,7 @@ python preprocess/prepare_dataset.py \
 
 ### 3. （任意）リサンプリング
 
-音声ファイルが 22050 Hz でない場合:
+オーディオファイルが 22050 Hz でない場合:
 
 ```bash
 python preprocess/resample_only.py \
@@ -317,7 +317,7 @@ python infer.py \
 | 引数 | デフォルト | 説明 |
 |---|---|---|
 | `--checkpoint` | (自動) | 学習済みモデルのパス。指定しない場合は HF から自動取得 |
-| `--audio` | （必須） | 入力音声のパス |
+| `--audio` | （必須） | 入力オーディオのパス |
 | `--output-midi` | `<audio>.mid` | 出力 MIDI のパス |
 | `--amp` | `false` | 混合精度推論を有効化 |
 | `--window-ms` | 学習時の値 | 推論ウィンドウサイズ (ms) |
