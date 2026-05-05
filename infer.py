@@ -51,6 +51,11 @@ def resolve_amp_dtype(device: torch.device, dtype_str: str) -> torch.dtype:
     return torch.float16
 
 
+SUPPORTED_AUDIO_EXTENSIONS = {
+    ".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".wma", ".aiff", ".aif",
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run Semi-CRF AMT inference on an audio file and export MIDI.",
@@ -61,8 +66,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=f"Path to the trained model checkpoint (.pth). If not provided, downloads from Hugging Face to {DEFAULT_CHECKPOINT_PATH}.",
     )
+
+    # 単一ファイルモード
     parser.add_argument(
-        "--audio", type=Path, required=True, help="Path to the input audio file"
+        "--audio", type=Path, default=None, help="Path to the input audio file"
     )
     parser.add_argument(
         "--output-midi",
@@ -70,6 +77,21 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Output MIDI path. Defaults to <audio_stem>.mid next to the input audio.",
     )
+
+    # ディレクトリバッチモード
+    parser.add_argument(
+        "--audio-dir",
+        type=Path,
+        default=None,
+        help="Directory containing audio files for batch inference.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Output directory for MIDI files when using --audio-dir. Defaults to --audio-dir.",
+    )
+
     parser.add_argument(
         "--device",
         type=str,
@@ -142,7 +164,18 @@ def parse_args() -> argparse.Namespace:
         help="Skip fully silent windows before model forward pass.",
     )
     parser.add_argument("--disable-tqdm", action="store_true")
-    return parser.parse_args()
+
+    args = parser.parse_args()
+
+    # --audio と --audio-dir は排他
+    if args.audio is None and args.audio_dir is None:
+        parser.error("--audio or --audio-dir is required.")
+    if args.audio is not None and args.audio_dir is not None:
+        parser.error("--audio and --audio-dir are mutually exclusive.")
+    if args.output_midi is not None and args.audio_dir is not None:
+        parser.error("--output-midi cannot be used with --audio-dir. Use --output-dir instead.")
+
+    return args
 
 def _ensure_checkpoint(checkpoint_path: Path | None) -> Path:
     if checkpoint_path is None:
@@ -213,17 +246,22 @@ def _load_model_and_settings(
     model_config = _coerce_model_config(raw_model_config)
     model = AudioSemiCRFTransformer(model_config)
 
-    raw_state_dict = checkpoint.get("model_state_dict")
-    if raw_state_dict is not None:
-        state_dict = raw_state_dict
-    elif all(isinstance(value, torch.Tensor) for value in checkpoint.values()):
-        state_dict = checkpoint
+    # EMA の重みがあれば優先的に使用する
+    ema_state_dict = checkpoint.get("ema_state_dict")
+    if ema_state_dict is not None:
+        state_dict = ema_state_dict
+        print("Using EMA weights from checkpoint.")
     else:
-        state_dict = None
+        raw_state_dict = checkpoint.get("model_state_dict")
+        if raw_state_dict is not None:
+            state_dict = raw_state_dict
+        elif all(isinstance(value, torch.Tensor) for value in checkpoint.values()):
+            state_dict = checkpoint
+        else:
+            state_dict = None
     if not isinstance(state_dict, dict):
         raise ValueError(f"Checkpoint does not contain a state_dict: {checkpoint_path}")
 
-    # Load state dict
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
@@ -941,27 +979,29 @@ def run_inference(
     }
 
 
-def main() -> None:
-    args = parse_args()
-    device = torch.device(args.device)
-    amp_dtype = resolve_amp_dtype(device, args.amp_dtype)
-    audio_path = args.audio.resolve()
-    output_midi_path = (
-        args.output_midi.resolve()
-        if args.output_midi is not None
-        else audio_path.with_suffix(".mid")
-    )
+def _collect_audio_files(directory: Path) -> list[Path]:
+    """ディレクトリ内の対応音声ファイルを再帰的に収集する。"""
+    files = [
+        path
+        for path in sorted(directory.rglob("*"))
+        if path.is_file() and path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
+    ]
+    return files
 
-    checkpoint_path = _ensure_checkpoint(args.checkpoint)
-    print(f"Loading checkpoint from {checkpoint_path}...")
-    model, model_config, settings = _load_model_and_settings(
-        checkpoint_path.resolve(),
-        device=device,
-        window_ms_override=args.window_ms,
-        stride_ms_override=args.stride_ms,
-        track_batch_size_override=args.semi_crf_track_batch_size,
-    )
 
+def _process_single_file(
+    audio_path: Path,
+    output_midi_path: Path,
+    *,
+    model: AudioSemiCRFTransformer,
+    model_config: SemiCRFModelConfig,
+    settings: InferenceSettings,
+    device: torch.device,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
+    args: argparse.Namespace,
+) -> None:
+    """1ファイルの音声読み込み→推論→MIDI出力を行う。"""
     print(f"Loading audio from {audio_path}...")
     waveform, source_sample_rate, source_channels = _load_audio(
         audio_path,
@@ -975,7 +1015,7 @@ def main() -> None:
         model_config=model_config,
         settings=settings,
         device=device,
-        amp_enabled=bool(args.amp),
+        amp_enabled=amp_enabled,
         amp_dtype=amp_dtype,
         velocity=int(args.velocity),
         merge_gap_ms=args.merge_gap_ms,
@@ -1014,6 +1054,64 @@ def main() -> None:
         f"silence_gate_rms_dbfs={args.silence_gate_rms_dbfs} "
         f"output_midi={output_midi_path}"
     )
+
+
+def main() -> None:
+    args = parse_args()
+    device = torch.device(args.device)
+    amp_dtype = resolve_amp_dtype(device, args.amp_dtype)
+
+    checkpoint_path = _ensure_checkpoint(args.checkpoint)
+    print(f"Loading checkpoint from {checkpoint_path}...")
+    model, model_config, settings = _load_model_and_settings(
+        checkpoint_path.resolve(),
+        device=device,
+        window_ms_override=args.window_ms,
+        stride_ms_override=args.stride_ms,
+        track_batch_size_override=args.semi_crf_track_batch_size,
+    )
+
+    # 処理対象ファイルリストの構築
+    if args.audio is not None:
+        # 単一ファイルモード
+        audio_path = args.audio.resolve()
+        output_midi_path = (
+            args.output_midi.resolve()
+            if args.output_midi is not None
+            else audio_path.with_suffix(".mid")
+        )
+        file_pairs = [(audio_path, output_midi_path)]
+    else:
+        # ディレクトリバッチモード
+        audio_dir = args.audio_dir.resolve()
+        output_dir = args.output_dir.resolve() if args.output_dir is not None else audio_dir
+        audio_files = _collect_audio_files(audio_dir)
+        if not audio_files:
+            print(f"No audio files found in {audio_dir}")
+            return
+        file_pairs = [
+            (path, output_dir / path.relative_to(audio_dir).with_suffix(".mid"))
+            for path in audio_files
+        ]
+        print(f"Found {len(file_pairs)} audio file(s) in {audio_dir}")
+
+    shared_kwargs = dict(
+        model=model,
+        model_config=model_config,
+        settings=settings,
+        device=device,
+        amp_enabled=bool(args.amp),
+        amp_dtype=amp_dtype,
+        args=args,
+    )
+
+    for file_index, (audio_path, output_midi_path) in enumerate(file_pairs):
+        if len(file_pairs) > 1:
+            print(f"\n[{file_index + 1}/{len(file_pairs)}] {audio_path.name}")
+        _process_single_file(audio_path, output_midi_path, **shared_kwargs)
+
+    if len(file_pairs) > 1:
+        print(f"\nDone. Processed {len(file_pairs)} file(s).")
 
 
 if __name__ == "__main__":
