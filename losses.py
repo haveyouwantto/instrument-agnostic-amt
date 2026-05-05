@@ -179,6 +179,14 @@ def compute_losses(
             valid_mask_expanded = frame_valid_mask.unsqueeze(-1)
             mask = mask & valid_mask_expanded
 
+        # 楽器ラベルがないデータセットのサンプルをマスクから除外する
+        mask_instrument_loss_flag = batch.get("mask_instrument_loss")
+        if mask_instrument_loss_flag is not None:
+            # mask_instrument_loss_flag: [B] (True = ロス計算しない)
+            # mask: [B, T, 88] → 対象サンプルの全フレーム・ピッチを False にする
+            exclude_mask = mask_instrument_loss_flag.to(device).view(-1, 1, 1)
+            mask = mask & ~exclude_mask
+
         if mask.sum() > 0:
             active_logits = instrument_logits[mask]  # [N, C]
             active_targets = instrument_targets[mask]  # [N, C]

@@ -47,12 +47,18 @@ def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         [b.get("valid_audio_frames", b["audio"].shape[-1]) for b in batch],
         dtype=torch.long,
     )
+    # 楽器ラベルなしデータの楽器分類ロスマスク (True = マスクしてロス計算しない)
+    mask_instrument_loss = torch.tensor(
+        [b.get("mask_instrument_loss", False) for b in batch],
+        dtype=torch.bool,
+    )
     return {
         "audio": audio,
         "frame_active_targets": frame_active_targets,
         "frame_instrument_targets": frame_instrument_targets,
         "interval_targets": interval_targets,
         "valid_audio_frames": valid_audio_frames,
+        "mask_instrument_loss": mask_instrument_loss,
     }
 
 

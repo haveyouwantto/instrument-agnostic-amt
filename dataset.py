@@ -601,6 +601,9 @@ class StemDataset(Dataset):
                     "use_for_cross_aug": bool(
                         dataset_entry.get("use_for_cross_aug", True)
                     ),
+                    "mask_instrument_loss": bool(
+                        dataset_entry.get("mask_instrument_loss", False)
+                    ),
                 }
             )
 
@@ -867,6 +870,9 @@ class StemDataset(Dataset):
             valid_audio_ms = 0
         valid_audio_frames_val = int(round(valid_audio_ms * self.sample_rate / 1000.0))
 
+        # 楽器ラベルがないデータセットの場合は楽器分類ロスをマスクする
+        mask_instrument_loss = selected_group.get("mask_instrument_loss", False)
+
         return {
             "song_name": song_name,
             "window_start_ms": window_start_ms,
@@ -875,4 +881,5 @@ class StemDataset(Dataset):
             "frame_instrument_targets": frame_instrument_targets,
             "interval_targets": interval_targets,
             "valid_audio_frames": valid_audio_frames_val,
+            "mask_instrument_loss": mask_instrument_loss,
         }
