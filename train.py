@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import random
+from copy import deepcopy
 from typing import Any
 from dataclasses import asdict
 
@@ -25,6 +26,26 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+class ModelEma(torch.nn.Module):
+    """モデルパラメータの指数移動平均を保持するラッパー。"""
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.9997):
+        super().__init__()
+        self.module = deepcopy(model)
+        self.module.eval()
+        self.decay = decay
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        for ema_param, model_param in zip(
+            self.module.state_dict().values(),
+            model.state_dict().values(),
+        ):
+            ema_param.copy_(
+                self.decay * ema_param + (1.0 - self.decay) * model_param.to(ema_param.device)
+            )
 
 
 def set_seed(seed: int):
@@ -190,6 +211,12 @@ def main():
         default=None,
         help="Path to pre-trained checkpoint for weight initialization",
     )
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.99,
+        help="EMA decay rate. Set to 0 to disable EMA.",
+    )
 
     args = parser.parse_args()
 
@@ -266,6 +293,12 @@ def main():
     if args.wandb:
         wandb.config.update({"model_config": asdict(config)})
 
+    # EMA
+    use_ema = args.ema_decay > 0.0
+    ema_model = ModelEma(model, decay=args.ema_decay) if use_ema else None
+    if use_ema:
+        logger.info(f"EMA enabled (decay={args.ema_decay})")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     if args.warmup_steps < 0:
         raise ValueError("--warmup_steps must be non-negative")
@@ -319,6 +352,8 @@ def main():
 
             if not optimizer_step_was_skipped:
                 scheduler.step()
+                if ema_model is not None:
+                    ema_model.update(model)
 
             loss_val = total_loss.item()
             epoch_loss += loss_val
@@ -341,21 +376,21 @@ def main():
             checkpoint_path = os.path.join(
                 args.save_dir, f"checkpoint_epoch_{epoch}.pth"
             )
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "loss": avg_epoch_loss,
+            save_dict = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "loss": avg_epoch_loss,
+                "model_config": asdict(config),
+                "config": {
                     "model_config": asdict(config),
-                    "config": {
-                        "model_config": asdict(config),
-                        "args": vars(args),
-                    },
+                    "args": vars(args),
                 },
-                checkpoint_path,
-            )
+            }
+            if ema_model is not None:
+                save_dict["ema_state_dict"] = ema_model.module.state_dict()
+            torch.save(save_dict, checkpoint_path)
             logger.info(f"Saved checkpoint to {checkpoint_path}")
 
     if args.wandb:
