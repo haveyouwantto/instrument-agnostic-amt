@@ -227,6 +227,11 @@ def main():
         default=Path("./manifest.csv"),
         help="Path to save the manifest CSV",
     )
+    parser.add_argument(
+        "--require-midi",
+        action="store_true",
+        help="MIDIファイルが存在するステムのみをマニフェストに含める",
+    )
     args = parser.parse_args()
 
     midis_dir = args.midis_dir.resolve()
@@ -246,15 +251,24 @@ def main():
     logger.info(f"Found {len(wav_files)} audio files.")
 
     rows = []
+    skipped_no_midi = 0
     for wav_path in tqdm(wav_files, desc="Processing stems"):
         mid_path = midis_dir / f"{wav_path.stem}.mid"
         if not mid_path.exists():
             mid_path = midis_dir / f"{wav_path.stem}.midi"
         target_mid_path = mid_path if mid_path.exists() else None
 
+        # --require-midi: MIDIがないステムはスキップする
+        if args.require_midi and target_mid_path is None:
+            skipped_no_midi += 1
+            continue
+
         row = process_stem(target_mid_path, wav_path, npz_dir, manifest_path.parent)
         if row:
             rows.append(row)
+
+    if skipped_no_midi > 0:
+        logger.info(f"Skipped {skipped_no_midi} stems without MIDI (--require-midi)")
 
     if not rows:
         logger.warning("No valid stems were processed.")
