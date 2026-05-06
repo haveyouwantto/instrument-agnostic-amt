@@ -53,13 +53,19 @@ def load_ir_mono(ir_path: Path, target_sample_rate: int) -> np.ndarray:
     return ir_data
 
 
-def apply_ir_to_audio(audio: np.ndarray, ir_mono: np.ndarray) -> np.ndarray:
+def apply_ir_to_audio(
+    audio: np.ndarray,
+    ir_mono: np.ndarray,
+    wet_mix: float = 1.0,
+) -> np.ndarray:
     """
-    ステレオオーディオにIRを畳み込み、元の長さに切り出してRMS正規化する。
+    ステレオオーディオにIRを畳み込み、dry/wetをブレンドしてRMS正規化する。
     audio: [channels, frames]
     ir_mono: [ir_frames]
+    wet_mix: 0.0ならdryのみ、1.0ならwetのみ
     """
     original_length = audio.shape[1]
+    wet_mix = float(np.clip(wet_mix, 0.0, 1.0))
 
     # 元のRMSを記録（正規化の基準）
     original_rms = np.sqrt(np.mean(audio**2))
@@ -78,17 +84,19 @@ def apply_ir_to_audio(audio: np.ndarray, ir_mono: np.ndarray) -> np.ndarray:
     # 元のオーディオと同じ長さに切り出す
     convolved = convolved[:, :original_length]
 
-    # RMS正規化: 畳み込み後のRMSを元のRMSに合わせる
+    # RMS正規化: wet単体のRMSを元のRMSに合わせる
     convolved_rms = np.sqrt(np.mean(convolved**2))
     if convolved_rms > 1e-8:
         convolved *= original_rms / convolved_rms
 
-    # ピーク制限
-    peak = np.abs(convolved).max()
-    if peak > PEAK_LIMIT:
-        convolved *= PEAK_LIMIT / peak
+    result = (1.0 - wet_mix) * audio + wet_mix * convolved
 
-    return convolved.astype(np.float32)
+    # ピーク制限
+    peak = np.abs(result).max()
+    if peak > PEAK_LIMIT:
+        result *= PEAK_LIMIT / peak
+
+    return result.astype(np.float32)
 
 
 def process_single_stem(
@@ -96,6 +104,7 @@ def process_single_stem(
     output_path: Path,
     ir_files: list[Path],
     target_sample_rate: int,
+    wet_mix_range: tuple[float, float],
     seed: int,
 ) -> str | None:
     """1つのステムにランダムなIRを適用して保存する"""
@@ -114,7 +123,8 @@ def process_single_stem(
             return f"SKIP(sr): {stem_path.name}"
 
         ir_mono = load_ir_mono(ir_path, target_sample_rate)
-        result = apply_ir_to_audio(audio, ir_mono)
+        wet_mix = rng.uniform(wet_mix_range[0], wet_mix_range[1])
+        result = apply_ir_to_audio(audio, ir_mono, wet_mix=wet_mix)
 
         # channels-lastに戻して保存
         sf.write(str(output_path), result.T, target_sample_rate, subtype="PCM_16")
@@ -164,7 +174,26 @@ def main():
         default=42,
         help="乱数シード（再現性のため）",
     )
+    parser.add_argument(
+        "--min_wet_mix",
+        type=float,
+        default=0.0,
+        help="IR wet成分の最小ブレンド量。0.0=dryのみ, 1.0=wetのみ",
+    )
+    parser.add_argument(
+        "--max_wet_mix",
+        type=float,
+        default=1.0,
+        help="IR wet成分の最大ブレンド量。0.0=dryのみ, 1.0=wetのみ",
+    )
     args = parser.parse_args()
+
+    min_wet_mix = float(np.clip(args.min_wet_mix, 0.0, 1.0))
+    max_wet_mix = float(np.clip(args.max_wet_mix, 0.0, 1.0))
+    if min_wet_mix > max_wet_mix:
+        logger.error("--min_wet_mix は --max_wet_mix 以下にしてください。")
+        return
+    wet_mix_range = (min_wet_mix, max_wet_mix)
 
     stems_dir = args.stems_dir.resolve()
     ir_dir = args.ir_dir.resolve()
@@ -205,7 +234,10 @@ def main():
         logger.info("すべてのファイルが処理済みです。")
         return
 
-    logger.info(f"処理対象: {len(pending_tasks)} ファイル (ワーカー数: {args.workers})")
+    logger.info(
+        f"処理対象: {len(pending_tasks)} ファイル "
+        f"(ワーカー数: {args.workers}, wet_mix={wet_mix_range[0]:.2f}-{wet_mix_range[1]:.2f})"
+    )
 
     # tqdm はオプショナル
     try:
@@ -224,6 +256,7 @@ def main():
                 output_path,
                 ir_files,
                 args.sample_rate,
+                wet_mix_range,
                 file_seed,
             ): stem_path
             for stem_path, output_path, file_seed in pending_tasks
