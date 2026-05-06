@@ -3,12 +3,251 @@ import random
 from pathlib import Path
 from typing import Optional, Tuple
 
+from scipy.ndimage import uniform_filter1d
 import numpy as np
+
+
+_PEDALBOARD_CHORUS = None
+_PEDALBOARD_PHASER = None
+
+
+def _load_pedalboard_modulation_plugins():
+    global _PEDALBOARD_CHORUS, _PEDALBOARD_PHASER
+
+    if _PEDALBOARD_CHORUS is not None and _PEDALBOARD_PHASER is not None:
+        return _PEDALBOARD_CHORUS, _PEDALBOARD_PHASER
+
+    try:
+        from pedalboard import Chorus, Phaser
+    except ImportError as exc:
+        raise ImportError(
+            "pedalboard is required for chorus/phaser augmentation. "
+            "Please install it with `pip install pedalboard`."
+        ) from exc
+
+    _PEDALBOARD_CHORUS = Chorus
+    _PEDALBOARD_PHASER = Phaser
+    return _PEDALBOARD_CHORUS, _PEDALBOARD_PHASER
+
+
+def transient_gain_augment(
+    samples: np.ndarray,
+    sample_rate: int,
+    gain: float = 1.5,
+    env_ms: float = 5.0,
+    smooth_ms: float = 2.0,
+    normalize: bool = False,
+):
+    """
+    samples:
+        mono:   shape (samples,)
+        stereo: shape (channels, samples)
+
+    gain:
+        1.0 なら変化なし
+        1.5 ならアタック強調
+        0.6 ならアタック弱化
+    """
+
+    x = samples.astype(np.float32)
+
+    # stereoなら平均してアタック検出用のmonoを作る
+    if x.ndim == 1:
+        mono = x
+    else:
+        mono = np.mean(x, axis=0)
+
+    env_win = max(1, int(sample_rate * env_ms / 1000))
+    smooth_win = max(1, int(sample_rate * smooth_ms / 1000))
+
+    # 短時間の音量包絡
+    env = uniform_filter1d(np.abs(mono), size=env_win)
+
+    # 立ち上がり成分だけ取り出す
+    diff = np.maximum(np.diff(env, prepend=env[0]), 0.0)
+
+    if diff.max() < 1e-8:
+        return samples
+
+    # 0〜1 に正規化
+    attack_mask = diff / (diff.max() + 1e-8)
+
+    # 少し滑らかにする
+    attack_mask = uniform_filter1d(attack_mask, size=smooth_win)
+
+    # attack部分だけgainを変える
+    gain_curve = 1.0 + (gain - 1.0) * attack_mask
+
+    if x.ndim == 1:
+        y = x * gain_curve
+    else:
+        y = x * gain_curve[None, :]
+
+    if normalize:
+        peak = np.max(np.abs(y))
+        if peak > 1.0:
+            y = y / peak
+
+    return y.astype(np.float32)
+
+
+def db_to_amp(db: float) -> float:
+    return 10.0 ** (db / 20.0)
+
+
+def amp_to_db(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    return 20.0 * np.log10(np.maximum(x, eps))
+
+
+def compressor_augment(
+    samples: np.ndarray,
+    sample_rate: int,
+    threshold_db: float = -18.0,
+    ratio: float = 2.0,
+    attack_ms: float = 15.0,
+    release_ms: float = 120.0,
+    makeup_gain_db: float = 0.0,
+    normalize: bool = False,
+) -> np.ndarray:
+    """
+    軽い dynamic range compressor。
+
+    samples:
+        mono:   shape (frames,)
+        stereo: shape (channels, frames)
+
+    threshold_db:
+        このレベルを超えた部分を圧縮する
+
+    ratio:
+        2.0 なら threshold 超過分を 1/2 にする
+
+    attack_ms:
+        圧縮がかかり始める速さ
+        小さいほどアタックを潰しやすい
+
+    release_ms:
+        圧縮が戻る速さ
+
+    makeup_gain_db:
+        圧縮後に全体を持ち上げる量
+    """
+
+    x = samples.astype(np.float32, copy=False)
+
+    is_mono = x.ndim == 1
+    if is_mono:
+        x_ch = x[None, :]
+        sidechain = np.abs(x)
+    else:
+        x_ch = x
+        # stereo/マルチchでは全ch共通のゲインを作る
+        sidechain = np.max(np.abs(x), axis=0)
+
+    n = sidechain.shape[0]
+    if n == 0:
+        return samples
+
+    # envelope follower
+    attack_coeff = np.exp(-1.0 / max(1.0, sample_rate * attack_ms / 1000.0))
+    release_coeff = np.exp(-1.0 / max(1.0, sample_rate * release_ms / 1000.0))
+
+    env = np.empty_like(sidechain, dtype=np.float32)
+    prev = 0.0
+
+    for i in range(n):
+        current = float(sidechain[i])
+
+        if current > prev:
+            coeff = attack_coeff
+        else:
+            coeff = release_coeff
+
+        prev = coeff * prev + (1.0 - coeff) * current
+        env[i] = prev
+
+    env_db = amp_to_db(env)
+
+    # thresholdを超えた分だけ圧縮
+    over_db = env_db - threshold_db
+    gain_reduction_db = np.zeros_like(env_db, dtype=np.float32)
+
+    mask = over_db > 0.0
+    # 入力がthresholdを over_db 超えたとき、
+    # 出力では over_db / ratio だけ超えるようにする
+    gain_reduction_db[mask] = -(over_db[mask] - over_db[mask] / ratio)
+
+    gain_db = gain_reduction_db + makeup_gain_db
+    gain = db_to_amp(gain_db).astype(np.float32)
+
+    y = x_ch * gain[None, :]
+
+    if is_mono:
+        y = y[0]
+
+    if normalize:
+        peak = np.max(np.abs(y))
+        if peak > 1.0:
+            y = y / peak
+
+    return y.astype(np.float32)
+
+
+def random_transient_gain(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+    return transient_gain_augment(
+        samples,
+        sample_rate,
+        gain=random.uniform(0.7, 1.4),
+        env_ms=random.uniform(3.0, 8.0),
+        smooth_ms=random.uniform(1.0, 4.0),
+        normalize=False,
+    )
+
+
+def random_light_compression(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+    return compressor_augment(
+        samples,
+        sample_rate,
+        threshold_db=random.uniform(-24.0, -12.0),
+        ratio=random.uniform(1.3, 2.5),
+        attack_ms=random.uniform(10.0, 35.0),
+        release_ms=random.uniform(80.0, 250.0),
+        makeup_gain_db=random.uniform(0.0, 2.0),
+        normalize=False,
+    )
+
+
+def random_chorus(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+    Chorus, _ = _load_pedalboard_modulation_plugins()
+
+    chorus = Chorus(
+        rate_hz=random.uniform(0.2, 1.1),
+        depth=random.uniform(0.05, 0.25),
+        centre_delay_ms=random.uniform(7.0, 18.0),
+        feedback=random.uniform(0.0, 0.08),
+        mix=random.uniform(0.12, 0.32),
+    )
+    y = chorus(samples.astype(np.float32, copy=False), sample_rate)
+    return y.astype(np.float32, copy=False)
+
+
+def random_phaser(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+    _, Phaser = _load_pedalboard_modulation_plugins()
+
+    phaser = Phaser(
+        rate_hz=random.uniform(0.12, 0.8),
+        depth=random.uniform(0.15, 0.45),
+        centre_frequency_hz=random.uniform(350.0, 1600.0),
+        feedback=random.uniform(0.0, 0.18),
+        mix=random.uniform(0.08, 0.24),
+    )
+    y = phaser(samples.astype(np.float32, copy=False), sample_rate)
+    return y.astype(np.float32, copy=False)
 
 
 class AudioAugmentor:
     """
-    オーディオ波形に対するデータ拡張（EQ、ピッチシフト(微小)、リバーブ、ノイズ）を適用するクラス。
+    オーディオ波形に対するデータ拡張（EQ、ピッチシフト(微小)、モジュレーション、リバーブ、ノイズ）を適用するクラス。
     """
 
     def __init__(
@@ -18,7 +257,7 @@ class AudioAugmentor:
             -0.2,
             0.2,
         ),  # マイクロチューニング
-        eq_db_range: Tuple[float, float] = (-3.0, 3.0),
+        eq_db_range: Tuple[float, float] = (-4.0, 4.0),
         snr_range: Tuple[float, float] = (3.0, 40.0),
         ir_folder: Optional[str | Path] = None,
         noise_folder: Optional[str | Path] = None,
@@ -39,11 +278,17 @@ class AudioAugmentor:
                 HighPassFilter,
                 PolarityInversion,
                 Reverse,
+                BandStopFilter,
+                Aliasing,
+                Lambda,
             )
         except ImportError:
             raise ImportError(
                 "audiomentations is not installed. Please run `pip install audiomentations`"
             )
+
+        # Lambda内でランダムに失敗しないよう、初期化時に依存を確認する。
+        _load_pedalboard_modulation_plugins()
 
         self.sample_rate = sample_rate
 
@@ -114,6 +359,23 @@ class AudioAugmentor:
                             max_q=1.5,
                             p=1.0,
                         ),
+                        # 特定帯域の自然な欠落
+                        BandStopFilter(
+                            min_center_freq=500.0,
+                            max_center_freq=6000.0,
+                            min_bandwidth_fraction=0.15,
+                            max_bandwidth_fraction=0.7,
+                            min_rolloff=6,
+                            max_rolloff=18,
+                            zero_phase=False,
+                            p=1.0,
+                        ),
+                        # 低品質処理っぽい折り返し/ザラつき
+                        Aliasing(
+                            min_sample_rate=10000,
+                            max_sample_rate=18000,
+                            p=1.0,
+                        ),
                     ],
                     p=0.75,
                 ),
@@ -142,6 +404,38 @@ class AudioAugmentor:
                 ),
                 PolarityInversion(p=0.1),
             ]
+        )
+
+        self.dynamics_transform = OneOf(
+            transforms=[
+                # アタックだけ揺らす
+                Lambda(
+                    transform=random_transient_gain,
+                    p=1.0,
+                ),
+                # 軽いコンプ
+                Lambda(
+                    transform=random_light_compression,
+                    p=1.0,
+                ),
+            ],
+            weights=[0.55, 0.45],
+            p=0.35,
+        )
+
+        self.modulation_transform = OneOf(
+            transforms=[
+                Lambda(
+                    transform=random_chorus,
+                    p=1.0,
+                ),
+                Lambda(
+                    transform=random_phaser,
+                    p=1.0,
+                ),
+            ],
+            weights=[0.5, 0.5],
+            p=0.25,
         )
 
         # 2. リバーブ (IRコンボリューション)
@@ -201,6 +495,12 @@ class AudioAugmentor:
         # 1. 基本変換
         x = self.basic_transform(x, sample_rate=self.sample_rate)
 
+        # 1.5. アタック/コンプなどのdynamic系
+        x = self.dynamics_transform(x, sample_rate=self.sample_rate)
+
+        # 1.75. chorus/phaserなどのmodulation系
+        x = self.modulation_transform(x, sample_rate=self.sample_rate)
+
         # 2. リバーブ (Dry/Wetをランダムにブレンド)
         if self.reverb is not None:
             x_reverb = self.reverb(x, sample_rate=self.sample_rate)
@@ -230,3 +530,101 @@ class AudioAugmentor:
                     x /= peak
 
         return x
+
+
+if __name__ == "__main__":
+    import argparse
+    import os
+    import soundfile as sf
+
+    parser = argparse.ArgumentParser(
+        description="Save dry and chorus/phaser previews using librosa's trumpet example."
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=Path,
+        default=Path("augmentation_preview"),
+        help="Directory to write preview wav files.",
+    )
+    parser.add_argument(
+        "--sample_rate",
+        type=int,
+        default=22050,
+        help="Preview sample rate.",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="Optional duration in seconds to load from the trumpet example.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible effect parameters.",
+    )
+    args = parser.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = args.out_dir / ".cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("XDG_CACHE_HOME", str(cache_dir))
+    os.environ.setdefault("NUMBA_CACHE_DIR", str(cache_dir / "numba"))
+
+    try:
+        import librosa
+    except ImportError as exc:
+        raise ImportError(
+            "librosa is required for the preview. Please install it with `pip install librosa`."
+        ) from exc
+
+    try:
+        audio_path = librosa.ex("trumpet")
+        audio, _ = librosa.load(
+            audio_path,
+            sr=args.sample_rate,
+            mono=False,
+            duration=args.duration,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to load librosa's trumpet example. "
+            "On first use, librosa downloads it from librosa.org, so network access may be required."
+        ) from exc
+
+    audio = audio.astype(np.float32, copy=False)
+    if audio.ndim == 1:
+        dry = np.stack([audio, audio], axis=0)
+    elif audio.shape[0] == 1:
+        dry = np.repeat(audio, 2, axis=0)
+    else:
+        dry = audio[:2]
+
+    chorus = random_chorus(dry, args.sample_rate)
+    phaser = random_phaser(dry, args.sample_rate)
+    chorus_phaser = random_phaser(chorus, args.sample_rate)
+    audio_augmentor = AudioAugmentor(sample_rate=args.sample_rate)(dry)
+
+    outputs = {
+        "trumpet_original.wav": dry,
+        "trumpet_chorus.wav": chorus,
+        "trumpet_phaser.wav": phaser,
+        "trumpet_chorus_phaser.wav": chorus_phaser,
+        "trumpet_audio_augmentor.wav": audio_augmentor,
+    }
+
+    for name, audio in outputs.items():
+        path = args.out_dir / name
+        y = audio.astype(np.float32, copy=False)
+        if y.size > 0:
+            peak = float(np.max(np.abs(y)))
+            if peak > 1.0:
+                y = y / peak
+        if y.ndim == 2:
+            y = y.T
+        sf.write(str(path), y, args.sample_rate, subtype="PCM_16")
+        print(path)

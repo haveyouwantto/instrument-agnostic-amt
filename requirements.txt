@@ -11,3 +11,4 @@ pretty_midi
 scipy
 wandb
 audiomentations
+pedalboard
