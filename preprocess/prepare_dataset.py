@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 MELODY_CLASS_ID = get_instrument_class_id_by_name("melody")
 MELODY_TRACK_KEYWORDS = ("vocal", "melody")
+DRUM_TRACK_KEYWORDS = ("drum",)
+DRUM_TRACK_NAMES = ("percussion",)
 
 
 def is_melody_track(instrument: pretty_midi.Instrument) -> bool:
@@ -27,18 +29,28 @@ def is_melody_track(instrument: pretty_midi.Instrument) -> bool:
     return any(keyword in name for keyword in MELODY_TRACK_KEYWORDS)
 
 
+def is_named_drum_track(instrument: pretty_midi.Instrument) -> bool:
+    """MIDIトラック名からドラム/打楽器トラックを判定する。"""
+    name = (instrument.name or "").strip().lower()
+    return name in DRUM_TRACK_NAMES or any(
+        keyword in name for keyword in DRUM_TRACK_KEYWORDS
+    )
+
+
 def is_excluded_instrument(instrument: pretty_midi.Instrument) -> bool:
     """
     ドラム、または音高ラベルとして扱いにくいGM音色を除外する。
 
     除外対象:
       - is_drum == True (通常MIDI Channel 10)
+      - トラック名が percussion
+      - トラック名に drum を含む
       - Timpani (47)
       - Synth Effects Family (96-103)
       - Percussive Family (112-119)
       - Sound Effects Family (120-127)
     """
-    if instrument.is_drum:
+    if instrument.is_drum or is_named_drum_track(instrument):
         return True
 
     prog = instrument.program
