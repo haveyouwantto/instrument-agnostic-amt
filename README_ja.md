@@ -6,6 +6,8 @@
 
 [![Campus mode!! new model](https://img.youtube.com/vi/IXSfVcErRro/0.jpg)](https://www.youtube.com/watch?v=IXSfVcErRro)
 
+> **Colab 補足**: [`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、**ステム分離してから採譜し、最後に MIDI をマージする** オプションのワークフローも入っています。曲全体をそのまま 1 回で採譜するより高精度になることが多く、特に音が重なりやすい密なアレンジで有効です。
+
 ---
 
 ## 概要
@@ -298,6 +300,16 @@ python infer.py --audio input_song.wav
 ```
 
 > **Note**: `--checkpoint` を指定しない場合、自動的に Hugging Face から最新のモデルがダウンロードされます。
+
+### Google Colab のステム分離ワークフロー
+
+Google Colab 用ノートブック [`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、以下のオプション機能があります。
+
+1. 入力した曲をステム分離する
+2. ドラム以外の各ステムを個別に採譜する
+3. ステムごとの MIDI を最後に 1 本へマージする
+
+この方法は、ミックス全体をそのまま単発で採譜するより時間はかかりますが、各ステムの音響的な複雑さが下がり、楽器同士の重なりも減るため、採譜精度が上がることが多いです。特に、バンド音源、密な伴奏、和音とメロディが強く重なる曲で有効です。
 
 ### その他のオプション
 

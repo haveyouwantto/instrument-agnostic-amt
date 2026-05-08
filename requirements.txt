@@ -12,3 +12,5 @@ scipy
 wandb
 audiomentations
 pedalboard
+dlchordx
+miditoolkit

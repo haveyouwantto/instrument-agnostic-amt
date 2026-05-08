@@ -6,6 +6,8 @@
 
 [![Campus mode!! new model](https://img.youtube.com/vi/IXSfVcErRro/0.jpg)](https://www.youtube.com/watch?v=IXSfVcErRro)
 
+> **Colab tip**: [`Colab_Inference.ipynb`](Colab_Inference.ipynb) also includes an optional **stem-separated transcription** workflow: separate the song into stems, transcribe each stem, then merge the MIDI files. This often gives better results than transcribing the full mix directly, especially for dense arrangements with overlapping instruments.
+
 ---
 
 ## What is this?
@@ -297,6 +299,16 @@ python infer.py --audio input_song.wav
 ```
 
 > **Note**: If `--checkpoint` is not provided, the model will be automatically downloaded from Hugging Face.
+
+### Stem-separated workflow in Google Colab
+
+The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) includes an optional workflow that:
+
+1. separates the uploaded song into stems,
+2. transcribes each non-drum stem individually,
+3. merges the per-stem MIDI files into one final MIDI.
+
+This is slower than single-pass inference on the mixed song, but in many cases it improves transcription accuracy because each stem is acoustically simpler and overlapping instruments are reduced. It is especially useful for busy mixes, band recordings, and arrangements with sustained chords plus melody lines.
 
 ### Additional options
 
