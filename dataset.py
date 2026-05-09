@@ -535,6 +535,7 @@ class StemDataset(Dataset):
                     "song_names": primary_songs,
                     "weight": 1.0,
                     "use_for_cross_aug": True,
+                    "mask_instrument_loss": False,
                 }
             )
 
@@ -553,12 +554,17 @@ class StemDataset(Dataset):
             probability = group["weight"] / total_weight * 100
             logger.info(
                 f"Dataset '{group['name']}': {len(group['song_names'])} songs, "
-                f"weight={group['weight']}, prob={probability:.1f}%, cross_aug={group.get('use_for_cross_aug', True)}"
+                f"weight={group['weight']}, prob={probability:.1f}%, "
+                f"cross_aug={group.get('use_for_cross_aug', True)}, "
+                f"mask_inst={group.get('mask_instrument_loss', False)}"
             )
 
         # Cross augmentation用のグループと累積確率を計算
         self.cross_dataset_groups = [
-            g for g in self.dataset_groups if g.get("use_for_cross_aug", True)
+            g
+            for g in self.dataset_groups
+            if g.get("use_for_cross_aug", True)
+            and not g.get("mask_instrument_loss", False)
         ]
         self._cross_cumulative_probs = []
         if self.cross_dataset_groups:
@@ -587,8 +593,13 @@ class StemDataset(Dataset):
 
             # ロード前の曲名を記録（新規追加分を特定するため）
             dataset_name = dataset_entry.get("name", manifest_rel)
+            mask_inst = bool(dataset_entry.get("mask_instrument_loss", False))
             existing_songs = set(self.stems_by_song.keys())
-            self._load_manifest(manifest_full, song_name_prefix=dataset_name)
+            self._load_manifest(
+                manifest_full,
+                song_name_prefix=dataset_name,
+                mask_instrument_loss=mask_inst,
+            )
             new_songs = [
                 name for name in self.stems_by_song if name not in existing_songs
             ]
@@ -607,7 +618,12 @@ class StemDataset(Dataset):
                 }
             )
 
-    def _load_manifest(self, manifest_path: str | Path, song_name_prefix: str = ""):
+    def _load_manifest(
+        self,
+        manifest_path: str | Path,
+        song_name_prefix: str = "",
+        mask_instrument_loss: bool = False,
+    ):
         """マニフェストCSVを読み込み、stems_by_songとall_stemsに追加する"""
         manifest_path = Path(manifest_path)
         manifest_dir = manifest_path.parent
@@ -629,6 +645,7 @@ class StemDataset(Dataset):
                     "duration_ms": int(row["duration_ms"]),
                     "end_note_ms": int(row["end_note_ms"]),
                     "note_count": int(row["note_count"]),
+                    "mask_instrument_loss": mask_instrument_loss,
                 }
                 self.stems_by_song[song_name].append(stem_info)
                 self.all_stems.append(stem_info)
@@ -706,6 +723,7 @@ class StemDataset(Dataset):
             rng.random() < self.p_cross_mix
             and len(self.all_stems) > 0
             and self.cross_dataset_groups
+            and not selected_group.get("mask_instrument_loss", False)
         ):
             for j in range(self.max_cross_stems):
                 # j回目の追加を行うかの継続確率 (j=0は1.0)
@@ -870,8 +888,11 @@ class StemDataset(Dataset):
             valid_audio_ms = 0
         valid_audio_frames_val = int(round(valid_audio_ms * self.sample_rate / 1000.0))
 
-        # 楽器ラベルがないデータセットの場合は楽器分類ロスをマスクする
-        mask_instrument_loss = selected_group.get("mask_instrument_loss", False)
+        # いずれかのステムが楽器ラベルなしデータセットの場合は楽器分類ロスをマスクする
+        mask_instrument_loss = any(
+            stem.get("mask_instrument_loss", False)
+            for stem, _ in active_stems_with_offset
+        )
 
         return {
             "song_name": song_name,
