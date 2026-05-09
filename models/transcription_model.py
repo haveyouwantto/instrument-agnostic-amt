@@ -236,6 +236,7 @@ class BackboneOutput:
     """Backbone の出力を band / pitch query に分離して保持する。"""
 
     band_features: torch.Tensor  # [B, num_bands, T, D]
+    global_features: Optional[torch.Tensor]  # [B, T, D] or None
     pitch_query_features: torch.Tensor  # [B, T, num_pitch_queries, D]
 
 
@@ -377,6 +378,7 @@ class Backbone(nn.Module):
         num_heads: int = 8,
         num_pitch_queries: int = 88,
         pitch_query_expansion_size: int = 4,
+        use_global_token: bool = False,
         dropout: float = 0.1,
         use_gradient_checkpoint: bool = True,
     ):
@@ -396,6 +398,7 @@ class Backbone(nn.Module):
         self.output_dim = output_dim if output_dim is not None else hidden_size
         self.use_gradient_checkpoint = use_gradient_checkpoint
         self.num_pitch_queries = num_pitch_queries
+        self.use_global_token = bool(use_global_token)
 
         self.num_audio_channels = feature_extractor.num_audio_channels
         self.n_bins = feature_extractor.n_bins
@@ -421,6 +424,16 @@ class Backbone(nn.Module):
         )
 
         self.band_type_embed = nn.Parameter(torch.zeros(1, 1, 1, base_ch * 4))
+        self.global_token = (
+            nn.Parameter(torch.zeros(1, 1, 1, base_ch * 4))
+            if self.use_global_token
+            else None
+        )
+        self.global_type_embed = (
+            nn.Parameter(torch.zeros(1, 1, 1, base_ch * 4))
+            if self.use_global_token
+            else None
+        )
         self.pitch_type_embed = nn.Parameter(torch.zeros(1, 1, 1, base_ch * 4))
 
         self.layers = nn.ModuleList([])
@@ -453,6 +466,16 @@ class Backbone(nn.Module):
             kernel_size=8,
             stride=8,
         )
+        self.global_up_conv = (
+            nn.ConvTranspose1d(
+                self.stem_dim,
+                self.stem_dim,
+                kernel_size=8,
+                stride=8,
+            )
+            if self.use_global_token
+            else None
+        )
 
     @staticmethod
     def _match_time_length(x: torch.Tensor, target_T: int) -> torch.Tensor:
@@ -484,10 +507,20 @@ class Backbone(nn.Module):
         pitch_query = pitch_query.unsqueeze(0).unsqueeze(0)  # [1, 1, P, D]
         pitch_query = pitch_query.expand(B, T, -1, -1)  # [B, T, P, D]
 
-        # [B, T, num_bands + P, D]
+        # [B, T, num_bands + (global) + P, D]
         x = x + self.band_type_embed
+        global_token = None
+        if self.use_global_token:
+            if self.global_token is None or self.global_type_embed is None:
+                raise RuntimeError("global token parameters must be initialized")
+            global_token = self.global_token.expand(B, T, -1, -1)
+            global_token = global_token + self.global_type_embed
         pitch_query = pitch_query + self.pitch_type_embed
-        x = torch.cat([x, pitch_query], dim=2)
+        tokens = [x]
+        if global_token is not None:
+            tokens.append(global_token)
+        tokens.append(pitch_query)
+        x = torch.cat(tokens, dim=2)
 
         for time_roformer, band_roformer in self.layers:
             B, T, K, D = x.shape
@@ -503,9 +536,14 @@ class Backbone(nn.Module):
 
         x = self.final_norm(x)
 
-        # band / pitch query を分離
+        # band / global / pitch query を分離
         band_part = x[:, :, :num_bands, :]  # [B, T, num_bands, D]
-        pitch_part = x[:, :, num_bands:, :]  # [B, T, P, D]
+        pitch_start = num_bands
+        global_part = None
+        if self.use_global_token:
+            global_part = x[:, :, pitch_start : pitch_start + 1, :]
+            pitch_start += 1
+        pitch_part = x[:, :, pitch_start:, :]  # [B, T, P, D]
 
         # pitch_part のみアップサンプリング
         B, T, P, D = pitch_part.shape
@@ -518,7 +556,18 @@ class Backbone(nn.Module):
         pitch_part = self._match_time_length(pitch_part, target_T)
         # pitch_part: [B, P, T_out, D]
 
+        global_features = None
+        if global_part is not None:
+            if self.global_up_conv is None:
+                raise RuntimeError("global_up_conv must be initialized")
+            global_part = einops.rearrange(global_part, "b t g d -> (b g) d t")
+            global_part = self.global_up_conv(global_part)
+            global_part = einops.rearrange(global_part, "(b g) d t -> b g t d", b=B, g=1)
+            global_part = self._match_time_length(global_part, target_T)
+            global_features = global_part.squeeze(1).contiguous()
+
         return BackboneOutput(
             band_features=band_part.permute(0, 2, 1, 3).contiguous(),
+            global_features=global_features,
             pitch_query_features=pitch_part.permute(0, 2, 1, 3).contiguous(),
         )

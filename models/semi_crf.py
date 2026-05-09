@@ -407,8 +407,41 @@ def _expand_track_lengths(
     if lengths.dim() != 1 or int(lengths.shape[0]) != batch_size:
         raise ValueError(
             f"valid_lengths must have shape [{batch_size}], got {tuple(lengths.shape)}"
-        )
+    )
     return lengths.unsqueeze(1).expand(batch_size, num_pitches).reshape(-1)
+
+
+def _expand_forced_start_positions(
+    forced_start_pos: Optional[torch.Tensor | List[int] | List[List[int]]],
+    *,
+    batch_size: int,
+    num_pitches: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """セグメント継続用の開始位置制約を flat track 形式へ変換する。"""
+    if forced_start_pos is None:
+        return None
+
+    positions = (
+        forced_start_pos.to(device=device, dtype=torch.long)
+        if isinstance(forced_start_pos, torch.Tensor)
+        else torch.tensor(forced_start_pos, device=device, dtype=torch.long)
+    )
+    if positions.dim() == 1:
+        if int(positions.shape[0]) != batch_size * num_pitches:
+            raise ValueError(
+                "forced_start_pos must have shape "
+                f"[{batch_size * num_pitches}] or [{batch_size}, {num_pitches}], "
+                f"got {tuple(positions.shape)}"
+            )
+        return positions.clamp_min(0)
+    if positions.dim() == 2 and tuple(positions.shape) == (batch_size, num_pitches):
+        return positions.reshape(-1).clamp_min(0)
+    raise ValueError(
+        "forced_start_pos must have shape "
+        f"[{batch_size * num_pitches}] or [{batch_size}, {num_pitches}], "
+        f"got {tuple(positions.shape)}"
+    )
 
 
 def _flatten_interval_diag(
@@ -692,6 +725,7 @@ def decode_pitch_intervals(
     length_scaling: str = "linear",
     length_penalty: float = 0.0,
     track_batch_size: int = 128,
+    forced_start_pos: Optional[torch.Tensor | List[int] | List[List[int]]] = None,
 ) -> PitchIntervalBatch:
     """
     Decode pitch-wise best non-overlapping intervals from interval query/key features.
@@ -713,6 +747,12 @@ def decode_pitch_intervals(
     )
     flat_lengths = _expand_track_lengths(
         valid_lengths,
+        batch_size=int(batch_size),
+        num_pitches=int(num_pitches),
+        device=interval_query.device,
+    )
+    flat_forced_start_pos = _expand_forced_start_positions(
+        forced_start_pos,
         batch_size=int(batch_size),
         num_pitches=int(num_pitches),
         device=interval_query.device,
@@ -775,7 +815,15 @@ def decode_pitch_intervals(
                     device=score.device,
                 ),
             )
-            decoded_chunk = semi_crf.decode()
+            if flat_forced_start_pos is not None:
+                chunk_forced_start_pos = torch.clamp(
+                    flat_forced_start_pos.index_select(0, chunk_indices),
+                    min=0,
+                    max=max(0, length - 1),
+                ).tolist()
+            else:
+                chunk_forced_start_pos = None
+            decoded_chunk = semi_crf.decode(forcedStartPos=chunk_forced_start_pos)
             for flat_index, intervals in zip(chunk_indices.tolist(), decoded_chunk):
                 decoded_flat[int(flat_index)] = intervals
 

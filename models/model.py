@@ -12,6 +12,8 @@ from instrument_classes import NUM_INSTRUMENT_CLASSES
 from .transcription_model import AudioFeatureExtractor, Backbone
 
 from .interval_boundaries import gather_interval_endpoint_features
+from .beat import BeatHead
+from .chord import ChordHead
 
 MIN_MIDI_PITCH = 21
 MAX_MIDI_PITCH = 108
@@ -47,6 +49,12 @@ class SemiCRFModelConfig:
     semi_crf_length_penalty: float = 0.0
     use_interval_boundary_head: bool = True
     num_instrument_classes: int = NUM_INSTRUMENT_CLASSES
+    use_beat_head: bool = False
+    num_meter_classes: int = 1
+    beat_head_hidden_dim: int | None = None
+    use_chord_head: bool = False
+    num_root_chord_classes: int = 745
+    chord_head_hidden_dim: int | None = None
 
 
 class TaskFeatureAdapter(nn.Module):
@@ -127,6 +135,10 @@ class AudioSemiCRFTransformer(nn.Module):
             raise ValueError(
                 "semi_crf_length_scaling must be one of {'linear', 'sqrt', 'none'}"
             )
+        if config.use_beat_head and config.num_meter_classes <= 0:
+            raise ValueError(
+                "num_meter_classes must be positive when beat head is used"
+            )
 
         self.config = config
         feature_extractor = AudioFeatureExtractor(
@@ -149,6 +161,7 @@ class AudioSemiCRFTransformer(nn.Module):
             num_layers=config.encoder_num_layers,
             num_heads=config.encoder_num_heads,
             num_pitch_queries=config.pitch_query_count,
+            use_global_token=config.use_beat_head or config.use_chord_head,
             dropout=config.dropout,
             use_gradient_checkpoint=config.use_gradient_checkpoint,
         )
@@ -174,6 +187,46 @@ class AudioSemiCRFTransformer(nn.Module):
         )
         self.instrument_classifier = nn.Linear(
             self.backbone.query_feature_dim, config.num_instrument_classes
+        )
+
+        # beat系
+        self.beat_adapter = (
+            TaskFeatureAdapter(
+                input_dim=self.backbone.query_feature_dim,
+                dropout=config.dropout,
+            )
+            if config.use_beat_head
+            else None
+        )
+        self.beat_head = (
+            BeatHead(
+                input_dim=self.backbone.query_feature_dim,
+                num_meter_classes=config.num_meter_classes,
+                hidden_dim=config.beat_head_hidden_dim,
+                dropout=config.dropout,
+            )
+            if config.use_beat_head
+            else None
+        )
+
+        # chord系
+        self.chord_adapter = (
+            TaskFeatureAdapter(
+                input_dim=self.backbone.query_feature_dim,
+                dropout=config.dropout,
+            )
+            if config.use_chord_head
+            else None
+        )
+        self.chord_head = (
+            ChordHead(
+                input_dim=self.backbone.query_feature_dim,
+                num_root_chord_classes=config.num_root_chord_classes,
+                hidden_dim=config.chord_head_hidden_dim,
+                dropout=config.dropout,
+            )
+            if config.use_chord_head
+            else None
         )
 
     def supports_interval_boundaries(self) -> bool:
@@ -238,30 +291,64 @@ class AudioSemiCRFTransformer(nn.Module):
         waveform: torch.Tensor,
         *,
         valid_audio_frames: Optional[torch.Tensor] = None,
+        include_amt: bool = True,
+        include_beat: bool = True,
+        include_chord: bool = True,
     ) -> dict[str, torch.Tensor]:
+        """各タスク head の有効/無効を切り替えながら推論する。"""
+        if not include_amt and not include_beat and not include_chord:
+            raise ValueError("At least one task head must be enabled")
+
         backbone_output = self.backbone(waveform)
         pitch_query_features = backbone_output.pitch_query_features
-        interval_features = self.interval_adapter(pitch_query_features)
-        instrument_features = self.instrument_adapter(pitch_query_features)
-        interval_query, interval_key, interval_diag = self.interval_scorer(
-            interval_features
-        )
-        frame_valid_mask = self._build_frame_valid_mask(
-            batch_size=int(waveform.shape[0]),
-            num_frames=int(interval_query.shape[1]),
-            valid_audio_frames=valid_audio_frames,
-            device=waveform.device,
-        )
-        instrument_logits = self.instrument_classifier(instrument_features)
+        global_features = backbone_output.global_features
 
-        return {
+        outputs = {
             "band_features": backbone_output.band_features,
-            "interval_query": interval_query,
-            "interval_key": interval_key,
-            "interval_diag": interval_diag,
+            "global_features": global_features,
             "pitch_query_features": pitch_query_features,
-            "interval_features": interval_features,
-            "instrument_features": instrument_features,
-            "instrument_logits": instrument_logits,
-            "frame_valid_mask": frame_valid_mask,
         }
+
+        # 1. AMT 本体の head は必要なときだけ計算する。
+        if include_amt:
+            interval_features = self.interval_adapter(pitch_query_features)
+            instrument_features = self.instrument_adapter(pitch_query_features)
+            interval_query, interval_key, interval_diag = self.interval_scorer(
+                interval_features
+            )
+            frame_valid_mask = self._build_frame_valid_mask(
+                batch_size=int(waveform.shape[0]),
+                num_frames=int(interval_query.shape[1]),
+                valid_audio_frames=valid_audio_frames,
+                device=waveform.device,
+            )
+            instrument_logits = self.instrument_classifier(instrument_features)
+
+            outputs.update(
+                {
+                    "interval_query": interval_query,
+                    "interval_key": interval_key,
+                    "interval_diag": interval_diag,
+                    "interval_features": interval_features,
+                    "instrument_features": instrument_features,
+                    "instrument_logits": instrument_logits,
+                    "frame_valid_mask": frame_valid_mask,
+                }
+            )
+
+        # 2. 補助タスクでは global token 側だけを使って不要な head 計算を避ける。
+        if include_beat and self.beat_head is not None:
+            if global_features is None:
+                raise RuntimeError("beat head requires global_features from backbone")
+            beat_features = self.beat_adapter(global_features)
+            outputs["beat_features"] = beat_features
+            outputs.update(self.beat_head(beat_features))
+
+        if include_chord and self.chord_head is not None:
+            if global_features is None:
+                raise RuntimeError("chord head requires global_features from backbone")
+            chord_features = self.chord_adapter(global_features)
+            outputs["chord_features"] = chord_features
+            outputs.update(self.chord_head(chord_features))
+
+        return outputs

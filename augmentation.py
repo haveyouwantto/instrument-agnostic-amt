@@ -257,7 +257,7 @@ class AudioAugmentor:
             -0.2,
             0.2,
         ),  # マイクロチューニング
-        eq_db_range: Tuple[float, float] = (-4.0, 4.0),
+        eq_db_range: Tuple[float, float] = (-6.0, 6.0),
         snr_range: Tuple[float, float] = (3.0, 40.0),
         ir_folder: Optional[str | Path] = None,
         noise_folder: Optional[str | Path] = None,
@@ -313,8 +313,8 @@ class AudioAugmentor:
                         LowShelfFilter(
                             min_center_freq=60,
                             max_center_freq=220,
-                            min_gain_db=-4.0,
-                            max_gain_db=2.5,
+                            min_gain_db=-6.0,
+                            max_gain_db=6.0,
                             min_q=0.3,
                             max_q=0.8,
                             p=1.0,
@@ -323,8 +323,8 @@ class AudioAugmentor:
                         HighShelfFilter(
                             min_center_freq=3500,
                             max_center_freq=high_shelf_max,
-                            min_gain_db=-4.0,
-                            max_gain_db=3.0,
+                            min_gain_db=-6.0,
+                            max_gain_db=6.0,
                             min_q=0.3,
                             max_q=0.8,
                             p=1.0,
@@ -333,8 +333,8 @@ class AudioAugmentor:
                         PeakingFilter(
                             min_center_freq=180,
                             max_center_freq=500,
-                            min_gain_db=-3.0,
-                            max_gain_db=2.0,
+                            min_gain_db=-6.0,
+                            max_gain_db=6.0,
                             min_q=0.4,
                             max_q=1.2,
                             p=1.0,
@@ -343,8 +343,8 @@ class AudioAugmentor:
                         PeakingFilter(
                             min_center_freq=700,
                             max_center_freq=2500,
-                            min_gain_db=-2.5,
-                            max_gain_db=2.5,
+                            min_gain_db=-6.0,
+                            max_gain_db=6.0,
                             min_q=0.4,
                             max_q=1.0,
                             p=1.0,
@@ -353,8 +353,8 @@ class AudioAugmentor:
                         PeakingFilter(
                             min_center_freq=2500,
                             max_center_freq=7000,
-                            min_gain_db=-2.5,
-                            max_gain_db=2.0,
+                            min_gain_db=-6.0,
+                            max_gain_db=6.0,
                             min_q=0.5,
                             max_q=1.5,
                             p=1.0,

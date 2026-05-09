@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Iterable
@@ -18,6 +18,8 @@ from tqdm.auto import tqdm
 from models.model import AudioSemiCRFTransformer, SemiCRFModelConfig
 from models.semi_crf import decode_pitch_intervals
 from dataset import MIN_MIDI_PITCH
+import numpy as np
+from inference_postprocess import MidiMetadataEmbedder
 
 
 DEFAULT_CHECKPOINT_URL = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main/best_model.pth?download=true"
@@ -26,6 +28,8 @@ DEFAULT_CHECKPOINT_PATH = Path("checkpoints/best_model.pth")
 
 @dataclass
 class PredictedNote:
+    """推論中のノートと、後段で楽器を確定するための集約情報を保持する。"""
+
     pitch: int
     start_frame: int
     end_frame: int
@@ -34,6 +38,8 @@ class PredictedNote:
     has_offset: bool = True
     instrument_id: int = 0
     instrument_candidates: tuple[int, ...] = ()
+    instrument_prob_sum: np.ndarray | None = None
+    instrument_frame_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -52,7 +58,16 @@ def resolve_amp_dtype(device: torch.device, dtype_str: str) -> torch.dtype:
 
 
 SUPPORTED_AUDIO_EXTENSIONS = {
-    ".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".wma", ".aiff", ".aif",
+    ".wav",
+    ".mp3",
+    ".flac",
+    ".ogg",
+    ".opus",
+    ".m4a",
+    ".aac",
+    ".wma",
+    ".aiff",
+    ".aif",
 }
 
 
@@ -148,6 +163,15 @@ def parse_args() -> argparse.Namespace:
         help="Constant MIDI velocity for predicted notes.",
     )
     parser.add_argument(
+        "--max-note-seconds",
+        type=float,
+        default=15.0,
+        help=(
+            "Delete notes whose duration is longer than or equal to this threshold. "
+            "Use 0 or a negative value to disable."
+        ),
+    )
+    parser.add_argument(
         "--max-midi-melodic-instruments",
         type=int,
         default=15,
@@ -165,6 +189,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--disable-tqdm", action="store_true")
 
+    parser.add_argument(
+        "--disable-beat", action="store_true", help="Disable beat embedding"
+    )
+    parser.add_argument(
+        "--disable-chord", action="store_true", help="Disable chord embedding"
+    )
+
     args = parser.parse_args()
 
     # --audio と --audio-dir は排他
@@ -173,21 +204,25 @@ def parse_args() -> argparse.Namespace:
     if args.audio is not None and args.audio_dir is not None:
         parser.error("--audio and --audio-dir are mutually exclusive.")
     if args.output_midi is not None and args.audio_dir is not None:
-        parser.error("--output-midi cannot be used with --audio-dir. Use --output-dir instead.")
+        parser.error(
+            "--output-midi cannot be used with --audio-dir. Use --output-dir instead."
+        )
 
     return args
+
 
 def _ensure_checkpoint(checkpoint_path: Path | None) -> Path:
     if checkpoint_path is None:
         checkpoint_path = DEFAULT_CHECKPOINT_PATH
 
     if not checkpoint_path.exists():
-        print(f"Checkpoint not found at {checkpoint_path}. Downloading from Hugging Face...")
+        print(
+            f"Checkpoint not found at {checkpoint_path}. Downloading from Hugging Face..."
+        )
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         torch.hub.download_url_to_file(DEFAULT_CHECKPOINT_URL, str(checkpoint_path))
 
     return checkpoint_path
-
 
 
 def _iter_batches(values: list[int], batch_size: int) -> Iterable[list[int]]:
@@ -384,85 +419,365 @@ def _compute_silent_window_mask(
     return torch.all(rms < float(silence_gate_rms_linear), dim=1)
 
 
-def _intervals_to_notes(
-    intervals_by_pitch: list[list[tuple[int, int]]],
-    *,
-    boundary_flags_by_pitch: list[list[tuple[bool, bool, float, float]]] | None,
-    instrument_logits: torch.Tensor | None,
-    window_start_frame: int,
-    valid_audio_frames: int,
-    total_audio_frames: int,
-    hop_length: int,
-    velocity: int,
-) -> list[PredictedNote]:
-    notes: list[PredictedNote] = []
-    window_valid_end = min(total_audio_frames, window_start_frame + valid_audio_frames)
-    for pitch_index, pitch_intervals in enumerate(intervals_by_pitch):
-        midi_pitch = MIN_MIDI_PITCH + pitch_index
-        pitch_boundary_flags = (
-            boundary_flags_by_pitch[pitch_index]
-            if boundary_flags_by_pitch is not None
-            else []
+class PitchFirstNoteStitcher:
+    """窓またぎのノート継続を pitch 優先で管理し、最後に楽器を確定する。"""
+
+    def __init__(
+        self,
+        *,
+        hop_length: int,
+        total_audio_frames: int,
+        velocity: int,
+        merge_gap_frames: int,
+        merge_onset_frames: int,
+    ) -> None:
+        # 1. 推論設定
+        self.hop_length = int(hop_length)
+        self.total_audio_frames = int(total_audio_frames)
+        self.velocity = int(velocity)
+        self.merge_gap_frames = int(merge_gap_frames)
+        self.merge_onset_frames = int(merge_onset_frames)
+
+        # 2. 窓またぎ状態
+        self.notes_by_pitch: dict[int, list[PredictedNote]] = defaultdict(list)
+        self.last_closed_global_frames: list[int] | None = None
+
+    def get_forced_start_positions(
+        self,
+        *,
+        window_start_frame: int,
+        num_pitches: int,
+        valid_model_frames: int,
+    ) -> list[int]:
+        """各 pitch の継続状態から、次の decode 開始位置制約を返す。"""
+        self._ensure_pitch_state(num_pitches)
+        if valid_model_frames <= 0:
+            return [0] * int(num_pitches)
+
+        window_model_start = int(round(float(window_start_frame) / float(self.hop_length)))
+        return [
+            max(
+                0,
+                min(
+                    int(last_closed_frame) - window_model_start,
+                    int(valid_model_frames) - 1,
+                ),
+            )
+            for last_closed_frame in self.last_closed_global_frames
+        ]
+
+    def consume_window(
+        self,
+        *,
+        intervals_by_pitch: list[list[tuple[int, int]]],
+        boundary_flags_by_pitch: list[list[tuple[bool, bool, float, float]]] | None,
+        instrument_logits: torch.Tensor | None,
+        window_start_frame: int,
+        valid_audio_frames: int,
+        valid_model_frames: int,
+    ) -> None:
+        """1ウィンドウ分の区間を取り込み、継続ノート状態を更新する。"""
+        self._ensure_pitch_state(len(intervals_by_pitch))
+        window_model_start = int(round(float(window_start_frame) / float(self.hop_length)))
+
+        for pitch_index, pitch_intervals in enumerate(intervals_by_pitch):
+            midi_pitch = int(MIN_MIDI_PITCH + pitch_index)
+            pitch_notes = self.notes_by_pitch[midi_pitch]
+            pitch_boundary_flags = (
+                boundary_flags_by_pitch[pitch_index]
+                if boundary_flags_by_pitch is not None
+                else []
+            )
+            local_last_closed_frame: int | None = None
+
+            for interval_index, (begin_frame, end_frame) in enumerate(pitch_intervals):
+                boundary_flag = (
+                    pitch_boundary_flags[interval_index]
+                    if interval_index < len(pitch_boundary_flags)
+                    else None
+                )
+                note = self._build_interval_note(
+                    pitch_index=int(pitch_index),
+                    begin_frame=int(begin_frame),
+                    end_frame=int(end_frame),
+                    boundary_flag=boundary_flag,
+                    instrument_logits=instrument_logits,
+                    window_start_frame=int(window_start_frame),
+                    valid_audio_frames=int(valid_audio_frames),
+                    valid_model_frames=int(valid_model_frames),
+                )
+                if note is None:
+                    continue
+
+                if pitch_notes and int(note.start_frame) < int(pitch_notes[-1].end_frame):
+                    if note.has_onset:
+                        pitch_notes[-1] = note
+                    else:
+                        self._merge_note_segments(
+                            pitch_notes[-1],
+                            note,
+                            overwrite_offset=True,
+                        )
+                    if note.has_offset:
+                        local_last_closed_frame = int(end_frame)
+                    continue
+
+                if note.has_onset:
+                    pitch_notes.append(note)
+                if note.has_offset:
+                    local_last_closed_frame = int(end_frame)
+
+            if local_last_closed_frame is not None:
+                self.last_closed_global_frames[pitch_index] = (
+                    window_model_start + int(local_last_closed_frame)
+                )
+
+    def finalize(self) -> list[PredictedNote]:
+        """窓ごとの継続状態を閉じ、最終的なノート列へ整形する。"""
+        for pitch_notes in self.notes_by_pitch.values():
+            if pitch_notes:
+                pitch_notes[-1].has_offset = True
+
+        stitched_notes = sorted(
+            [
+                note
+                for pitch_notes in self.notes_by_pitch.values()
+                for note in pitch_notes
+                if note.has_offset
+            ],
+            key=lambda note: (note.start_frame, note.pitch, note.end_frame),
         )
-        for interval_index, (begin_frame, end_frame) in enumerate(pitch_intervals):
-            has_onset, has_offset, onset_off, offset_off = (
-                pitch_boundary_flags[interval_index]
-                if interval_index < len(pitch_boundary_flags)
-                else (True, True, 0.0, 1.0)  # offset default fallback
+        merged_notes = self._merge_nearby_notes(stitched_notes)
+        return self._assign_note_instruments(merged_notes)
+
+    def _ensure_pitch_state(self, num_pitches: int) -> None:
+        """pitch 数に応じた継続状態バッファを初期化する。"""
+        if self.last_closed_global_frames is None:
+            self.last_closed_global_frames = [0] * int(num_pitches)
+            return
+        if len(self.last_closed_global_frames) != int(num_pitches):
+            raise ValueError(
+                "num_pitches changed during note stitching: "
+                f"{len(self.last_closed_global_frames)} -> {num_pitches}"
             )
 
-            # Use real float offset
-            start_frame = window_start_frame + int(
-                round((float(begin_frame) + float(onset_off)) * float(hop_length))
+    def _resolve_interval_boundary_flags(
+        self,
+        *,
+        begin_frame: int,
+        end_frame: int,
+        valid_model_frames: int,
+        boundary_flag: tuple[bool, bool, float, float] | None,
+    ) -> tuple[bool, bool, float, float]:
+        """境界ヘッドが無い場合でも、窓端の継続フラグを補完する。"""
+        if boundary_flag is not None:
+            return boundary_flag
+
+        last_valid_frame = max(0, int(valid_model_frames) - 1)
+        return (
+            bool(int(begin_frame) > 0),
+            bool(int(end_frame) < last_valid_frame),
+            0.0,
+            1.0,
+        )
+
+    def _extract_interval_instrument_stats(
+        self,
+        *,
+        instrument_logits: torch.Tensor | None,
+        begin_frame: int,
+        end_frame: int,
+        pitch_index: int,
+    ) -> tuple[np.ndarray | None, int]:
+        """区間内の楽器確率をフレーム和として集約する。"""
+        if instrument_logits is None:
+            return None, 0
+
+        interval_start = max(0, int(begin_frame))
+        interval_end = min(int(end_frame) + 1, int(instrument_logits.shape[0]))
+        if interval_end <= interval_start:
+            return None, 0
+
+        note_logits = instrument_logits[interval_start:interval_end, pitch_index, :]
+        note_prob_sum = (
+            torch.sigmoid(note_logits)
+            .sum(dim=0)
+            .float()
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
+        return note_prob_sum, int(note_logits.shape[0])
+
+    def _build_interval_note(
+        self,
+        *,
+        pitch_index: int,
+        begin_frame: int,
+        end_frame: int,
+        boundary_flag: tuple[bool, bool, float, float] | None,
+        instrument_logits: torch.Tensor | None,
+        window_start_frame: int,
+        valid_audio_frames: int,
+        valid_model_frames: int,
+    ) -> PredictedNote | None:
+        """1つの decode 区間を、stitch 用ノート候補へ変換する。"""
+        has_onset, has_offset, onset_off, offset_off = self._resolve_interval_boundary_flags(
+            begin_frame=int(begin_frame),
+            end_frame=int(end_frame),
+            valid_model_frames=int(valid_model_frames),
+            boundary_flag=boundary_flag,
+        )
+
+        start_frame = window_start_frame + int(
+            round((float(begin_frame) + float(onset_off)) * float(self.hop_length))
+        )
+        end_frame_exclusive = window_start_frame + min(
+            int(valid_audio_frames),
+            int(round((float(end_frame) + float(offset_off)) * float(self.hop_length))),
+        )
+
+        start_frame = max(0, min(start_frame, self.total_audio_frames))
+        end_frame_exclusive = max(
+            start_frame + 1,
+            min(end_frame_exclusive, self.total_audio_frames),
+        )
+        window_valid_end = min(
+            self.total_audio_frames,
+            int(window_start_frame) + int(valid_audio_frames),
+        )
+        if start_frame >= window_valid_end:
+            return None
+
+        instrument_prob_sum, instrument_frame_count = self._extract_interval_instrument_stats(
+            instrument_logits=instrument_logits,
+            begin_frame=int(begin_frame),
+            end_frame=int(end_frame),
+            pitch_index=int(pitch_index),
+        )
+        return PredictedNote(
+            pitch=int(MIN_MIDI_PITCH + pitch_index),
+            start_frame=int(start_frame),
+            end_frame=int(end_frame_exclusive),
+            velocity=int(self.velocity),
+            has_onset=bool(has_onset),
+            has_offset=bool(has_offset),
+            instrument_id=0,
+            instrument_candidates=(),
+            instrument_prob_sum=instrument_prob_sum,
+            instrument_frame_count=int(instrument_frame_count),
+        )
+
+    def _accumulate_note_instrument_stats(
+        self,
+        target: PredictedNote,
+        source: PredictedNote,
+    ) -> None:
+        """窓またぎで分割された区間の楽器確率を加算する。"""
+        if source.instrument_prob_sum is None or source.instrument_frame_count <= 0:
+            return
+        if target.instrument_prob_sum is None or target.instrument_frame_count <= 0:
+            target.instrument_prob_sum = source.instrument_prob_sum.copy()
+            target.instrument_frame_count = int(source.instrument_frame_count)
+            return
+        target.instrument_prob_sum = (
+            target.instrument_prob_sum + source.instrument_prob_sum
+        ).astype(np.float32, copy=False)
+        target.instrument_frame_count += int(source.instrument_frame_count)
+
+    def _merge_note_segments(
+        self,
+        target: PredictedNote,
+        source: PredictedNote,
+        *,
+        overwrite_offset: bool,
+    ) -> None:
+        """同一 pitch の分割区間を1ノートへ統合する。"""
+        target.end_frame = max(int(target.end_frame), int(source.end_frame))
+        target.velocity = max(int(target.velocity), int(source.velocity))
+        target.has_onset = bool(target.has_onset or source.has_onset)
+        if overwrite_offset:
+            target.has_offset = bool(source.has_offset)
+        else:
+            target.has_offset = bool(target.has_offset or source.has_offset)
+        self._accumulate_note_instrument_stats(target, source)
+
+    def _merge_nearby_notes(self, notes: list[PredictedNote]) -> list[PredictedNote]:
+        """最終段の軽いクレンジングとして、近接した同一 pitch を再統合する。"""
+        if not notes:
+            return []
+
+        ordered_notes = sorted(
+            notes,
+            key=lambda note: (
+                note.pitch,
+                note.start_frame,
+                note.end_frame,
+            ),
+        )
+        merged: list[PredictedNote] = []
+        current = replace(ordered_notes[0])
+        for note in ordered_notes[1:]:
+            can_merge_by_gap = (
+                note.pitch == current.pitch
+                and note.start_frame <= current.end_frame + self.merge_gap_frames
+                and not note.has_onset
             )
-            end_frame_exclusive = window_start_frame + min(
-                valid_audio_frames,
-                int(round((float(end_frame) + float(offset_off)) * float(hop_length))),
+            can_merge_by_onset = (
+                note.pitch == current.pitch
+                and abs(note.start_frame - current.start_frame)
+                <= self.merge_onset_frames
             )
 
-            start_frame = max(0, min(start_frame, total_audio_frames))
-            end_frame_exclusive = max(
-                start_frame + 1,
-                min(end_frame_exclusive, total_audio_frames),
-            )
-            if start_frame >= window_valid_end:
+            if can_merge_by_gap:
+                self._merge_note_segments(current, note, overwrite_offset=True)
+                continue
+            if can_merge_by_onset:
+                self._merge_note_segments(current, note, overwrite_offset=False)
+                continue
+            merged.append(current)
+            current = replace(note)
+        merged.append(current)
+        return sorted(
+            merged,
+            key=lambda note: (
+                note.start_frame,
+                note.pitch,
+                note.end_frame,
+            ),
+        )
+
+    def _assign_note_instruments(self, notes: list[PredictedNote]) -> list[PredictedNote]:
+        """集約済みの楽器確率から、最終的な楽器IDと候補順を確定する。"""
+        finalized_notes: list[PredictedNote] = []
+        for note in notes:
+            if note.instrument_prob_sum is None or note.instrument_frame_count <= 0:
+                finalized_notes.append(
+                    replace(
+                        note,
+                        instrument_id=0,
+                        instrument_candidates=(0,),
+                        instrument_prob_sum=None,
+                        instrument_frame_count=0,
+                    )
+                )
                 continue
 
-            if instrument_logits is not None:
-                interval_start = int(begin_frame)
-                interval_end = min(int(end_frame), valid_audio_frames)
-                if interval_end > interval_start:
-                    note_logits = instrument_logits[
-                        interval_start:interval_end, pitch_index, :
-                    ]
-                    note_probs = torch.sigmoid(note_logits).mean(dim=0)
-                    instrument_candidates = tuple(
-                        int(idx)
-                        for idx in torch.argsort(note_probs, descending=True).tolist()
-                    )
-                    instrument_id = instrument_candidates[0]
-                else:
-                    instrument_id = 0
-                    instrument_candidates = (0,)
-            else:
-                instrument_id = 0
-                instrument_candidates = (0,)
-
-            notes.append(
-                PredictedNote(
-                    pitch=int(midi_pitch),
-                    start_frame=int(start_frame),
-                    end_frame=int(end_frame_exclusive),
-                    velocity=int(velocity),
-                    has_onset=bool(has_onset),
-                    has_offset=bool(has_offset),
+            note_probs = note.instrument_prob_sum / float(note.instrument_frame_count)
+            order = np.argsort(-note_probs.astype(np.float64, copy=False))
+            instrument_candidates = tuple(int(index) for index in order.tolist())
+            instrument_id = int(instrument_candidates[0]) if instrument_candidates else 0
+            finalized_notes.append(
+                replace(
+                    note,
                     instrument_id=instrument_id,
-                    instrument_candidates=instrument_candidates,
+                    instrument_candidates=instrument_candidates or (0,),
+                    instrument_prob_sum=None,
+                    instrument_frame_count=0,
                 )
             )
-    return sorted(
-        notes, key=lambda note: (note.start_frame, note.end_frame, note.pitch)
-    )
+        return finalized_notes
 
 
 def _decode_boundary_features(
@@ -478,6 +793,8 @@ def _decode_boundary_features(
     if not entries:
         return flags
 
+    # 分布計算は低精度のままだと不安定になりやすいため、ここだけ FP32 に戻す。
+    boundary_logits = boundary_logits.float()
     presence_logits, offset_logits = boundary_logits.chunk(2, dim=-1)
     boundary_presence = presence_logits > 0.0
 
@@ -496,77 +813,6 @@ def _decode_boundary_features(
             )
         )
     return flags
-
-
-def _merge_notes(
-    notes: list[PredictedNote],
-    *,
-    merge_gap_frames: int,
-    merge_onset_frames: int,
-) -> list[PredictedNote]:
-    if not notes:
-        return []
-
-    ordered_notes = sorted(
-        notes,
-        key=lambda note: (
-            note.pitch,
-            note.instrument_id,
-            note.start_frame,
-            note.end_frame,
-        ),
-    )
-    merged: list[PredictedNote] = []
-    current = replace(ordered_notes[0])
-    for note in ordered_notes[1:]:
-        can_merge_by_gap = (
-            note.pitch == current.pitch
-            and note.instrument_id == current.instrument_id
-            and note.start_frame <= current.end_frame + int(merge_gap_frames)
-            and not note.has_onset
-            and not current.has_offset
-        )
-        can_merge_by_onset = (
-            note.pitch == current.pitch
-            and note.instrument_id == current.instrument_id
-            and abs(note.start_frame - current.start_frame) <= int(merge_onset_frames)
-        )
-
-        if can_merge_by_gap or can_merge_by_onset:
-            current.end_frame = max(current.end_frame, note.end_frame)
-            current.velocity = max(current.velocity, note.velocity)
-            current.has_onset = current.has_onset or note.has_onset
-            current.has_offset = current.has_offset or note.has_offset
-            continue
-        merged.append(current)
-        current = replace(note)
-    merged.append(current)
-    return sorted(
-        merged,
-        key=lambda note: (
-            note.start_frame,
-            note.pitch,
-            note.instrument_id,
-            note.end_frame,
-        ),
-    )
-
-
-def _stitch_boundary_aware_notes(
-    notes: list[PredictedNote],
-) -> list[PredictedNote]:
-    if not notes:
-        return []
-
-    return sorted(
-        notes,
-        key=lambda note: (
-            note.start_frame,
-            note.end_frame,
-            note.pitch,
-            note.instrument_id,
-        ),
-    )
 
 
 def _truncate_overlapping_notes(
@@ -633,6 +879,28 @@ def _truncate_overlapping_notes(
             note.end_frame,
         ),
     )
+
+
+def _filter_long_notes(
+    notes: list[PredictedNote],
+    *,
+    max_duration_frames: int,
+) -> tuple[list[PredictedNote], int]:
+    """一定時間以上の長すぎるノートを除外する。"""
+    if max_duration_frames <= 0:
+        return notes, 0
+
+    kept_notes: list[PredictedNote] = []
+    removed_count = 0
+    for note in notes:
+        # 15秒以上を削除したいので、閾値ちょうども除外対象にする。
+        duration_frames = int(note.end_frame) - int(note.start_frame)
+        if duration_frames >= int(max_duration_frames):
+            removed_count += 1
+            continue
+        kept_notes.append(note)
+
+    return kept_notes, removed_count
 
 
 def _remap_overflow_midi_instruments(
@@ -772,11 +1040,12 @@ def run_inference(
     velocity: int,
     merge_gap_ms: float | None,
     merge_onset_ms: float,
+    max_note_seconds: float,
     silence_gate_rms_dbfs: float | None,
     window_batch_size: int,
     max_midi_melodic_instruments: int,
     disable_tqdm: bool,
-) -> tuple[list[PredictedNote], dict[str, int]]:
+) -> tuple[list[PredictedNote], dict[str, int], dict[str, np.ndarray]]:
     if waveform.dim() != 2 or int(waveform.shape[0]) != 2:
         raise ValueError("waveform must have shape [2, audio_frames]")
 
@@ -795,13 +1064,13 @@ def run_inference(
     if stride_audio_frames <= 0:
         raise ValueError("stride_ms must be positive")
 
+    # 1. 推論全体で共有する設定と状態を準備する。
     window_starts = _build_window_starts(
         total_audio_frames=total_audio_frames,
         window_audio_frames=window_audio_frames,
         stride_audio_frames=stride_audio_frames,
     )
     silence_gate_linear = _silence_gate_rms_linear(silence_gate_rms_dbfs)
-    predicted_notes: list[PredictedNote] = []
     skipped_silent_window_count = 0
     decoded_window_count = 0
     progress = tqdm(
@@ -812,8 +1081,46 @@ def run_inference(
         disable=bool(disable_tqdm),
     )
 
-    use_boundary_stitching = bool(model.supports_interval_boundaries())
+    hop_length = int(model_config.hop_length)
+    total_model_frames = math.ceil(total_audio_frames / hop_length)
+    merge_gap_frames = (
+        int(model_config.hop_length)
+        if merge_gap_ms is None
+        else max(0, int(round(float(merge_gap_ms) * sample_rate / 1000.0)))
+    )
+    merge_onset_frames = max(
+        0, int(round(float(merge_onset_ms) * sample_rate / 1000.0))
+    )
+    max_note_frames = max(0, int(round(float(max_note_seconds) * sample_rate)))
+    note_stitcher = PitchFirstNoteStitcher(
+        hop_length=hop_length,
+        total_audio_frames=total_audio_frames,
+        velocity=int(velocity),
+        merge_gap_frames=merge_gap_frames,
+        merge_onset_frames=merge_onset_frames,
+    )
+
+    # 2. ノート処理とは独立に、補助タスク用ロジットの集約バッファを用意する。
+    # chord
+    agg_chord_boundary = np.zeros(total_model_frames, dtype=np.float32)
+    agg_root_chord = None  # 後で次元がわかってから初期化
+    agg_bass = None
+    agg_key_boundary = np.zeros(total_model_frames, dtype=np.float32)
+    agg_key = None
+    # beat
+    agg_beat = np.zeros(total_model_frames, dtype=np.float32)
+    agg_downbeat = np.zeros(total_model_frames, dtype=np.float32)
+    agg_meter = None
+
+    agg_weights = np.zeros(total_model_frames, dtype=np.float32)
+
+    # 三角形の重み窓
+    model_frames_per_window = math.ceil(window_audio_frames / hop_length)
+    window_weight = np.bartlett(model_frames_per_window).astype(np.float32)
+
+    use_boundary_head = bool(model.supports_interval_boundaries())
     for batch_starts in progress:
+        # 3. 窓ごとの audio batch を作る。
         window_tensors = []
         valid_audio_frames = []
         for start_frame in batch_starts:
@@ -866,86 +1173,184 @@ def run_inference(
                 valid_audio_frames=valid_audio_frames_tensor,
             )
 
+        # 4. ノート decode は状態を持つので、窓順に stitcher へ流し込む。
         valid_lengths = outputs["frame_valid_mask"].to(dtype=torch.long).sum(dim=-1)
-        decoded_intervals = decode_pitch_intervals(
-            outputs["interval_query"],
-            outputs["interval_key"],
-            outputs["interval_diag"],
-            valid_lengths,
-            length_scaling=settings.length_scaling,
-            length_penalty=settings.length_penalty,
-            track_batch_size=settings.track_batch_size,
-        )
+        num_pitches = int(outputs["interval_query"].shape[2])
+
+        # 1. forward はまとめて計算しつつ、decode は時間順状態を保つため 1 窓ずつ行う。
+        decoded_intervals_batch: list[list[list[tuple[int, int]]]] = []
+        for sample_index, start_frame in enumerate(active_batch_starts):
+            sample_valid_length = int(valid_lengths[sample_index].item())
+            if sample_valid_length <= 0:
+                decoded_intervals_batch.append([[] for _ in range(num_pitches)])
+                continue
+
+            forced_start_pos = note_stitcher.get_forced_start_positions(
+                window_start_frame=int(start_frame),
+                num_pitches=num_pitches,
+                valid_model_frames=int(sample_valid_length),
+            )
+            decoded_intervals = decode_pitch_intervals(
+                outputs["interval_query"][sample_index : sample_index + 1],
+                outputs["interval_key"][sample_index : sample_index + 1],
+                outputs["interval_diag"][sample_index : sample_index + 1],
+                valid_lengths[sample_index : sample_index + 1],
+                length_scaling=settings.length_scaling,
+                length_penalty=settings.length_penalty,
+                track_batch_size=settings.track_batch_size,
+                forced_start_pos=[forced_start_pos],
+            )
+            decoded_intervals_batch.append(decoded_intervals[0])
 
         boundary_flags_batch: (
             list[list[list[tuple[bool, bool, float, float]]]] | None
         ) = None
-        if use_boundary_stitching:
+        if use_boundary_head:
+            # boundary head は autocast の外で呼ぶので、入力も明示的に FP32 に揃える。
             boundary_logits, boundary_entries = model.predict_interval_boundaries(
-                outputs.get("interval_features", outputs["pitch_query_features"]),
-                decoded_intervals,
+                outputs.get(
+                    "interval_features", outputs["pitch_query_features"]
+                ).float(),
+                decoded_intervals_batch,
             )
             boundary_flags_batch = _decode_boundary_features(
                 boundary_logits,
                 boundary_entries,
                 batch_size=len(active_batch_starts),
-                num_pitches=int(outputs["interval_query"].shape[2]),
+                num_pitches=num_pitches,
             )
 
         sample_logits_batch = outputs.get("instrument_logits")
 
-        for sample_index, (
-            start_frame,
-            valid_frames,
-            intervals_by_pitch,
-        ) in enumerate(
-            zip(active_batch_starts, active_valid_audio_frames, decoded_intervals)
+        for sample_index, (start_frame, valid_frames) in enumerate(
+            zip(active_batch_starts, active_valid_audio_frames)
         ):
+            sample_valid_length = int(valid_lengths[sample_index].item())
+            intervals_by_pitch = decoded_intervals_batch[sample_index]
             sample_boundary_flags = (
                 boundary_flags_batch[sample_index]
                 if boundary_flags_batch is not None
                 else None
             )
             sample_logits = (
-                sample_logits_batch[sample_index, :valid_frames]
+                sample_logits_batch[sample_index, :sample_valid_length]
                 if sample_logits_batch is not None
                 else None
             )
-            predicted_notes.extend(
-                _intervals_to_notes(
-                    intervals_by_pitch,
-                    boundary_flags_by_pitch=sample_boundary_flags,
-                    instrument_logits=sample_logits,
-                    window_start_frame=int(start_frame),
-                    valid_audio_frames=int(valid_frames),
-                    total_audio_frames=total_audio_frames,
-                    hop_length=int(model_config.hop_length),
-                    velocity=int(velocity),
-                )
+            note_stitcher.consume_window(
+                intervals_by_pitch=intervals_by_pitch,
+                boundary_flags_by_pitch=sample_boundary_flags,
+                instrument_logits=sample_logits,
+                window_start_frame=int(start_frame),
+                valid_audio_frames=int(valid_frames),
+                valid_model_frames=int(sample_valid_length),
             )
 
-    merge_gap_frames = (
-        int(model_config.hop_length)
-        if merge_gap_ms is None
-        else max(0, int(round(float(merge_gap_ms) * sample_rate / 1000.0)))
-    )
-    merge_onset_frames = max(
-        0, int(round(float(merge_onset_ms) * sample_rate / 1000.0))
-    )
+            # 5. Chord / Beat のロジットはノート処理と分けて平均集約する。
+            f_start = int(round(start_frame / hop_length))
+            f_end = f_start + int(sample_valid_length)
+            f_end = min(f_end, total_model_frames)
+            num_valid_f = f_end - f_start
 
-    # 1. 境界線を利用したステッチング（利用可能な場合）
-    notes_after_stitching = (
-        _stitch_boundary_aware_notes(predicted_notes)
-        if use_boundary_stitching
-        else predicted_notes
-    )
+            # 重みの適用（端を減衰させる）
+            w = window_weight[:num_valid_f]
+            agg_weights[f_start:f_end] += w
 
-    # 2. 重複・近接ノートの最終的なマージ処理（オンセット距離も考慮）
-    merged_notes = _merge_notes(
-        notes_after_stitching,
-        merge_gap_frames=merge_gap_frames,
-        merge_onset_frames=merge_onset_frames,
-    )
+            # Chord
+            if "root_chord_logits" in outputs:
+                if agg_root_chord is None:
+                    agg_root_chord = np.zeros(
+                        (total_model_frames, outputs["root_chord_logits"].shape[-1]),
+                        dtype=np.float32,
+                    )
+                    agg_bass = np.zeros(
+                        (total_model_frames, outputs["bass_logits"].shape[-1]),
+                        dtype=np.float32,
+                    )
+                    agg_key = np.zeros(
+                        (total_model_frames, outputs["key_logits"].shape[-1]),
+                        dtype=np.float32,
+                    )
+
+                # numpy に変換して加算
+                cb = (
+                    outputs["chord_boundary_logits"][sample_index, :num_valid_f]
+                    .float()
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+                rc = (
+                    outputs["root_chord_logits"][sample_index, :num_valid_f]
+                    .float()
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+                ba = (
+                    outputs["bass_logits"][sample_index, :num_valid_f]
+                    .float()
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+                kb = (
+                    outputs["key_boundary_logits"][sample_index, :num_valid_f]
+                    .float()
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+                ke = (
+                    outputs["key_logits"][sample_index, :num_valid_f]
+                    .float()
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+
+                agg_chord_boundary[f_start:f_end] += cb * w
+                agg_root_chord[f_start:f_end] += rc * w[:, None]
+                agg_bass[f_start:f_end] += ba * w[:, None]
+                agg_key_boundary[f_start:f_end] += kb * w
+                agg_key[f_start:f_end] += ke * w[:, None]
+
+            # Beat
+            if "beat_logits" in outputs:
+                if agg_meter is None:
+                    agg_meter = np.zeros(
+                        (total_model_frames, outputs["meter_logits"].shape[-1]),
+                        dtype=np.float32,
+                    )
+
+                bt = (
+                    outputs["beat_logits"][sample_index, :num_valid_f]
+                    .float()
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+                db = (
+                    outputs["downbeat_logits"][sample_index, :num_valid_f]
+                    .float()
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+                mt = (
+                    outputs["meter_logits"][sample_index, :num_valid_f]
+                    .float()
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+
+                agg_beat[f_start:f_end] += bt * w
+                agg_downbeat[f_start:f_end] += db * w
+                agg_meter[f_start:f_end] += mt * w[:, None]
+
+    # 6. stitcher から最終ノート系列を受け取り、MIDI 出力向け後処理を行う。
+    merged_notes = note_stitcher.finalize()
 
     remapped_notes, remap_stats = _remap_overflow_midi_instruments(
         merged_notes,
@@ -967,16 +1372,48 @@ def run_inference(
             min_separation_frames=max(1, int(round(float(sample_rate) * 0.005))),
         )
 
-    return merged_notes, {
-        "window_count": len(window_starts),
-        "decoded_window_count": int(decoded_window_count),
-        "skipped_silent_window_count": int(skipped_silent_window_count),
-        "window_audio_frames": int(window_audio_frames),
-        "stride_audio_frames": int(stride_audio_frames),
-        "merge_gap_frames": int(merge_gap_frames),
-        "merge_onset_frames": int(merge_onset_frames),
-        **remap_stats,
-    }
+    # 4. 明らかに長すぎる持続ノートを最終段で除外する。
+    merged_notes, removed_long_note_count = _filter_long_notes(
+        merged_notes,
+        max_duration_frames=max_note_frames,
+    )
+    remap_stats["midi_instrument_count_after_remap"] = len(
+        {int(note.instrument_id) for note in merged_notes}
+    )
+
+    # ロジットの正規化 (除算)
+    # 重みが 0 の箇所（末尾など）での 0 除算を避ける
+    safe_weights = np.where(agg_weights > 1e-6, agg_weights, 1.0)
+
+    aggregated_logits = {}
+    if agg_root_chord is not None:
+        aggregated_logits["chord_boundary_logits"] = agg_chord_boundary / safe_weights
+        aggregated_logits["root_chord_logits"] = agg_root_chord / safe_weights[:, None]
+        aggregated_logits["bass_logits"] = agg_bass / safe_weights[:, None]
+        aggregated_logits["key_boundary_logits"] = agg_key_boundary / safe_weights
+        aggregated_logits["key_logits"] = agg_key / safe_weights[:, None]
+
+    if agg_meter is not None:
+        aggregated_logits["beat_logits"] = agg_beat / safe_weights
+        aggregated_logits["downbeat_logits"] = agg_downbeat / safe_weights
+        aggregated_logits["meter_logits"] = agg_meter / safe_weights[:, None]
+
+    return (
+        merged_notes,
+        {
+            "window_count": len(window_starts),
+            "decoded_window_count": int(decoded_window_count),
+            "skipped_silent_window_count": int(skipped_silent_window_count),
+            "window_audio_frames": int(window_audio_frames),
+            "stride_audio_frames": int(stride_audio_frames),
+            "merge_gap_frames": int(merge_gap_frames),
+            "merge_onset_frames": int(merge_onset_frames),
+            "removed_long_note_count": int(removed_long_note_count),
+            "max_note_frames": int(max_note_frames),
+            **remap_stats,
+        },
+        aggregated_logits,
+    )
 
 
 def _collect_audio_files(directory: Path) -> list[Path]:
@@ -1009,7 +1446,7 @@ def _process_single_file(
     )
 
     print("Running inference...")
-    notes, stats = run_inference(
+    notes, stats, aggregated_logits = run_inference(
         model=model,
         waveform=waveform,
         model_config=model_config,
@@ -1020,6 +1457,7 @@ def _process_single_file(
         velocity=int(args.velocity),
         merge_gap_ms=args.merge_gap_ms,
         merge_onset_ms=args.merge_onset_ms,
+        max_note_seconds=float(args.max_note_seconds),
         silence_gate_rms_dbfs=args.silence_gate_rms_dbfs,
         window_batch_size=int(args.window_batch_size),
         max_midi_melodic_instruments=int(args.max_midi_melodic_instruments),
@@ -1027,8 +1465,27 @@ def _process_single_file(
     )
 
     midi = _build_midi(notes, sample_rate=int(model_config.sample_rate))
+
+    # メタデータの埋め込み
+    if aggregated_logits and not (args.disable_beat and args.disable_chord):
+        print("Embedding chords, keys, and beats into MIDI...")
+        embedder = MidiMetadataEmbedder(
+            sample_rate=int(model_config.sample_rate),
+            hop_length=int(model_config.hop_length),
+        )
+        # miditoolkit オブジェクトが返る
+        midi = embedder.embed_all(
+            midi,
+            aggregated_logits,
+            disable_beat=args.disable_beat,
+            disable_chord=args.disable_chord,
+        )
+
     output_midi_path.parent.mkdir(parents=True, exist_ok=True)
-    midi.write(str(output_midi_path))
+    if hasattr(midi, "dump"):
+        midi.dump(str(output_midi_path))
+    else:
+        midi.write(str(output_midi_path))
 
     duration_seconds = float(waveform.shape[-1]) / float(model_config.sample_rate)
     print(
@@ -1047,6 +1504,8 @@ def _process_single_file(
     )
     print(
         f"decoded_notes={len(notes)} "
+        f"removed_long_notes={stats['removed_long_note_count']} "
+        f"max_note_seconds={args.max_note_seconds} "
         f"midi_instruments_before_remap={stats['midi_instrument_count_before_remap']} "
         f"midi_instruments_after_remap={stats['midi_instrument_count_after_remap']} "
         f"remapped_instruments={stats['remapped_instrument_count']} "
@@ -1084,7 +1543,9 @@ def main() -> None:
     else:
         # ディレクトリバッチモード
         audio_dir = args.audio_dir.resolve()
-        output_dir = args.output_dir.resolve() if args.output_dir is not None else audio_dir
+        output_dir = (
+            args.output_dir.resolve() if args.output_dir is not None else audio_dir
+        )
         audio_files = _collect_audio_files(audio_dir)
         if not audio_files:
             print(f"No audio files found in {audio_dir}")
