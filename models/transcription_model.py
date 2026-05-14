@@ -122,6 +122,34 @@ class AudioFeatureExtractor(nn.Module):
         std = spec.std(dim=reduce_dims, keepdim=True).clamp_min(1e-8)
         return (spec - mean) / std
 
+    def _apply_spec_augment_to_large_cqt(
+        self,
+        large_cqt_spec: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        絶対周波数側の CQT に SpecAugment を適用する。
+
+        HCQT へ分解する前に大域 CQT 上でマスクすることで、
+        別 harmonic channel への周波数リークを抑える。
+        random fill を安全に使うため、一度サンプル単位で標準化してから
+        SpecAugment をかけ、最後に元スケールへ戻す。
+        """
+        if self.spec_augment is None or not self.training:
+            return large_cqt_spec
+
+        # SpecAugment は 3D 入力時に [B, T, F] を想定している。
+        large_cqt_bt_f = large_cqt_spec.transpose(1, 2)
+        reduce_dims = tuple(range(1, large_cqt_bt_f.ndim))
+        mean = large_cqt_bt_f.mean(dim=reduce_dims, keepdim=True)
+        std = large_cqt_bt_f.std(dim=reduce_dims, keepdim=True).clamp_min(1e-8)
+
+        normalized_large_cqt = (large_cqt_bt_f - mean) / std
+        augmented_large_cqt, _ = self.spec_augment(normalized_large_cqt)
+        restored_large_cqt = augmented_large_cqt * std + mean
+
+        # CQT 振幅として使うので、数値誤差や random fill 由来の負値は切り落とす。
+        return restored_large_cqt.transpose(1, 2).clamp_min(0.0)
+
     def forward(
         self,
         waveform: torch.Tensor,
@@ -144,13 +172,16 @@ class AudioFeatureExtractor(nn.Module):
         waveform_flat = einops.rearrange(waveform_features, "b c t -> (b c) t").float()
 
         # 1つの巨大なCQTを計算
-        # large_cqt_spec: [B, F_large, T]
+        # large_cqt_spec: [B * audio_channels, F_large, T]
         large_cqt_spec = self.cqt(waveform_flat)
 
         # ナイキスト周波数を超えて除外した高周波ビンがある場合、ゼロパディングして次元を合わせる
         if self.actual_cqt_bins < self.n_bins_large:
             pad_amount = self.n_bins_large - self.actual_cqt_bins
             large_cqt_spec = F.pad(large_cqt_spec, (0, 0, 0, pad_amount))
+
+        # HCQT へ分解する前に、絶対周波数側の CQT へ SpecAugment を適用する。
+        large_cqt_spec = self._apply_spec_augment_to_large_cqt(large_cqt_spec)
 
         F_large = large_cqt_spec.shape[1]
 
@@ -210,9 +241,6 @@ class AudioFeatureExtractor(nn.Module):
 
         # Stereo channels and harmonics are treated as Backbone input channels.
         spec = einops.rearrange(spec, "b c h f t -> b (c h) f t").contiguous()
-
-        if self.training and self.spec_augment is not None:
-            spec, _ = self.spec_augment(spec)
 
         spec = spec.to(waveform.dtype)
 
