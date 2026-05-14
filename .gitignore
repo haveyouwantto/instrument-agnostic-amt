@@ -231,6 +231,7 @@ results/
 IRs/
 checkpoints/
 dataset_config.yaml
+*.yaml
 .codex
 
 beat_chord_dataset/

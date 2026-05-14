@@ -491,15 +491,12 @@ class StemDataset(Dataset):
         self.p_use_stems_augments = float(p_use_stems_augments)
         self.seed = int(seed)
         self.epoch = 0
-
-        if self.p_augment > 0.0:
-            self.augmentor = AudioAugmentor(
-                sample_rate=self.sample_rate,
-                ir_folder=ir_folder,
-                noise_folder=noise_folder,
-            )
-        else:
-            self.augmentor = None
+        self.ir_folder = ir_folder
+        self.noise_folder = noise_folder
+        self.group_augmentors: dict[str, AudioAugmentor | None] = {}
+        self.drum_augmentor = self._build_audio_augmentor(
+            distortion_augmentations=None
+        )
 
         self.p_drum_mix = float(p_drum_mix)
         self.drum_files: list[str] = []
@@ -536,7 +533,11 @@ class StemDataset(Dataset):
                     "weight": 1.0,
                     "use_for_cross_aug": True,
                     "mask_instrument_loss": False,
+                    "distortion_augmentations": (),
                 }
+            )
+            self.group_augmentors["main"] = self._build_audio_augmentor(
+                distortion_augmentations=()
             )
 
         # primaryデータセット（最初のグループ）の曲名リスト
@@ -556,7 +557,8 @@ class StemDataset(Dataset):
                 f"Dataset '{group['name']}': {len(group['song_names'])} songs, "
                 f"weight={group['weight']}, prob={probability:.1f}%, "
                 f"cross_aug={group.get('use_for_cross_aug', True)}, "
-                f"mask_inst={group.get('mask_instrument_loss', False)}"
+                f"mask_inst={group.get('mask_instrument_loss', False)}, "
+                f"distort={group.get('distortion_augmentations', ()) or 'none'}"
             )
 
         # Cross augmentation用のグループと累積確率を計算
@@ -573,6 +575,26 @@ class StemDataset(Dataset):
             for g in self.cross_dataset_groups:
                 cumulative_cross += g["weight"] / total_cross_weight
                 self._cross_cumulative_probs.append(cumulative_cross)
+
+    def _build_audio_augmentor(
+        self,
+        *,
+        distortion_augmentations: list[str] | tuple[str, ...] | None,
+    ) -> AudioAugmentor | None:
+        """設定された distortion 種別に応じた augmentor を構築する。"""
+        if self.p_augment <= 0.0:
+            return None
+        return AudioAugmentor(
+            sample_rate=self.sample_rate,
+            ir_folder=self.ir_folder,
+            noise_folder=self.noise_folder,
+            distortion_augmentations=distortion_augmentations,
+        )
+
+    def _get_stem_augmentor(self, stem: dict[str, Any]) -> AudioAugmentor | None:
+        """stem が属する dataset group 用の augmentor を返す。"""
+        group_name = str(stem.get("dataset_group_name", "main"))
+        return self.group_augmentors.get(group_name)
 
     def _load_config(self, config_path: str | Path):
         """YAMLコンフィグを読み込み、各データセットのマニフェストをロードする"""
@@ -594,11 +616,15 @@ class StemDataset(Dataset):
             # ロード前の曲名を記録（新規追加分を特定するため）
             dataset_name = dataset_entry.get("name", manifest_rel)
             mask_inst = bool(dataset_entry.get("mask_instrument_loss", False))
+            distortion_augmentations = tuple(
+                dataset_entry.get("distortion_augmentations", []) or []
+            )
             existing_songs = set(self.stems_by_song.keys())
             self._load_manifest(
                 manifest_full,
                 song_name_prefix=dataset_name,
                 mask_instrument_loss=mask_inst,
+                dataset_group_name=str(dataset_name),
             )
             new_songs = [
                 name for name in self.stems_by_song if name not in existing_songs
@@ -615,7 +641,11 @@ class StemDataset(Dataset):
                     "mask_instrument_loss": bool(
                         dataset_entry.get("mask_instrument_loss", False)
                     ),
+                    "distortion_augmentations": distortion_augmentations,
                 }
+            )
+            self.group_augmentors[str(dataset_name)] = self._build_audio_augmentor(
+                distortion_augmentations=distortion_augmentations
             )
 
     def _load_manifest(
@@ -623,6 +653,7 @@ class StemDataset(Dataset):
         manifest_path: str | Path,
         song_name_prefix: str = "",
         mask_instrument_loss: bool = False,
+        dataset_group_name: str = "main",
     ):
         """マニフェストCSVを読み込み、stems_by_songとall_stemsに追加する"""
         manifest_path = Path(manifest_path)
@@ -646,6 +677,7 @@ class StemDataset(Dataset):
                     "end_note_ms": int(row["end_note_ms"]),
                     "note_count": int(row["note_count"]),
                     "mask_instrument_loss": mask_instrument_loss,
+                    "dataset_group_name": str(dataset_group_name),
                 }
                 self.stems_by_song[song_name].append(stem_info)
                 self.all_stems.append(stem_info)
@@ -781,8 +813,9 @@ class StemDataset(Dataset):
                 window_ms=self.window_ms,
             )
             # データ拡張 (EQ, マイクロチューニング, リバーブ, ノイズ)
-            if self.augmentor is not None and rng.random() < self.p_augment:
-                audio = self.augmentor(audio)
+            stem_augmentor = self._get_stem_augmentor(stem)
+            if stem_augmentor is not None and rng.random() < self.p_augment:
+                audio = stem_augmentor(audio)
 
             # 音量ランダム調整（-6dB 〜 6dB）
             gain = 10.0 ** (rng.uniform(-6.0, 6.0) / 20.0)
@@ -826,8 +859,8 @@ class StemDataset(Dataset):
                     window_ms=self.window_ms,
                 )
 
-                if self.augmentor is not None and rng.random() < self.p_augment:
-                    drum_audio = self.augmentor(drum_audio)
+                if self.drum_augmentor is not None and rng.random() < self.p_augment:
+                    drum_audio = self.drum_augmentor(drum_audio)
 
                 gain = 10.0 ** (rng.uniform(-6.0, 6.0) / 20.0)
                 mixed_audio += drum_audio * gain

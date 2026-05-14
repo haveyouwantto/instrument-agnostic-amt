@@ -9,6 +9,12 @@ import numpy as np
 
 _PEDALBOARD_CHORUS = None
 _PEDALBOARD_PHASER = None
+SUPPORTED_DISTORTION_AUGMENTATIONS = (
+    "saturation",
+    "soft_clipping",
+    "hard_clipping",
+    "asymmetric_saturation",
+)
 
 
 def _load_pedalboard_modulation_plugins():
@@ -208,12 +214,157 @@ def random_light_compression(samples: np.ndarray, sample_rate: int) -> np.ndarra
     return compressor_augment(
         samples,
         sample_rate,
-        threshold_db=random.uniform(-24.0, -12.0),
-        ratio=random.uniform(1.3, 2.5),
-        attack_ms=random.uniform(10.0, 35.0),
-        release_ms=random.uniform(80.0, 250.0),
-        makeup_gain_db=random.uniform(0.0, 2.0),
+        threshold_db=random.uniform(-30.0, -12.0),
+        ratio=random.uniform(2.0, 5.0),
+        attack_ms=random.uniform(5.0, 30.0),
+        release_ms=random.uniform(50.0, 250.0),
+        makeup_gain_db=random.uniform(0.0, 6.0),
         normalize=False,
+    )
+
+
+def _normalize_peak_if_needed(samples: np.ndarray) -> np.ndarray:
+    """必要なときだけピークを 1.0 以下へ正規化する。"""
+    peak = float(np.max(np.abs(samples))) if samples.size > 0 else 0.0
+    if peak > 1.0:
+        samples = samples / peak
+    return samples.astype(np.float32, copy=False)
+
+
+def _blend_dry_wet(
+    dry: np.ndarray,
+    wet: np.ndarray,
+    *,
+    mix: float,
+) -> np.ndarray:
+    """dry/wet を線形補間し、必要ならピークを正規化する。"""
+    mix = float(np.clip(mix, 0.0, 1.0))
+    blended = (1.0 - mix) * dry + mix * wet
+    return _normalize_peak_if_needed(blended)
+
+
+def _validate_distortion_augmentations(
+    distortion_augmentations: Optional[Tuple[str, ...] | list[str]],
+) -> tuple[str, ...]:
+    """歪み系 augment 名を検証し、重複を除いたタプルへ正規化する。"""
+    if distortion_augmentations is None:
+        return ()
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for effect_name in distortion_augmentations:
+        effect_name = str(effect_name)
+        if effect_name not in SUPPORTED_DISTORTION_AUGMENTATIONS:
+            raise ValueError(
+                "Unsupported distortion augmentation: "
+                f"{effect_name}. Supported values are "
+                f"{SUPPORTED_DISTORTION_AUGMENTATIONS}."
+            )
+        if effect_name in seen:
+            continue
+        seen.add(effect_name)
+        normalized.append(effect_name)
+    return tuple(normalized)
+
+
+def saturation_augment(
+    samples: np.ndarray,
+    sample_rate: int,
+    drive: float = 2.5,
+    mix: float = 1.0,
+) -> np.ndarray:
+    """対称な tanh saturation を適用する。"""
+    del sample_rate
+    x = samples.astype(np.float32, copy=False)
+    drive = max(1.0, float(drive))
+    wet = np.tanh(drive * x) / np.tanh(drive)
+    return _blend_dry_wet(x, wet, mix=mix)
+
+
+def soft_clipping_augment(
+    samples: np.ndarray,
+    sample_rate: int,
+    drive: float = 2.0,
+    mix: float = 1.0,
+) -> np.ndarray:
+    """arctan ベースの滑らかな soft clipping を適用する。"""
+    del sample_rate
+    x = samples.astype(np.float32, copy=False)
+    drive = max(1.0, float(drive))
+    wet = (2.0 / np.pi) * np.arctan(drive * x)
+    return _blend_dry_wet(x, wet, mix=mix)
+
+
+def hard_clipping_augment(
+    samples: np.ndarray,
+    sample_rate: int,
+    drive: float = 2.0,
+    threshold: float = 0.6,
+    mix: float = 1.0,
+) -> np.ndarray:
+    """増幅後に閾値で打ち切る hard clipping を適用する。"""
+    del sample_rate
+    x = samples.astype(np.float32, copy=False)
+    drive = max(1.0, float(drive))
+    threshold = float(np.clip(threshold, 1e-3, 1.0))
+    wet = np.clip(drive * x, -threshold, threshold) / threshold
+    return _blend_dry_wet(x, wet, mix=mix)
+
+
+def asymmetric_saturation_augment(
+    samples: np.ndarray,
+    sample_rate: int,
+    positive_drive: float = 2.5,
+    negative_drive: float = 1.4,
+    mix: float = 1.0,
+) -> np.ndarray:
+    """正負で異なる drive を使う非対称 saturation を適用する。"""
+    del sample_rate
+    x = samples.astype(np.float32, copy=False)
+    positive_drive = max(1.0, float(positive_drive))
+    negative_drive = max(1.0, float(negative_drive))
+
+    positive = np.tanh(positive_drive * np.maximum(x, 0.0)) / np.tanh(positive_drive)
+    negative = np.tanh(negative_drive * np.minimum(x, 0.0)) / np.tanh(negative_drive)
+    wet = positive + negative
+    return _blend_dry_wet(x, wet, mix=mix)
+
+
+def random_saturation(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+    return saturation_augment(
+        samples,
+        sample_rate,
+        drive=random.uniform(1.4, 5.0),
+        mix=random.uniform(0.2, 0.7),
+    )
+
+
+def random_soft_clipping(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+    return soft_clipping_augment(
+        samples,
+        sample_rate,
+        drive=random.uniform(1.2, 4.0),
+        mix=random.uniform(0.15, 0.6),
+    )
+
+
+def random_hard_clipping(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+    return hard_clipping_augment(
+        samples,
+        sample_rate,
+        drive=random.uniform(1.4, 4.5),
+        threshold=random.uniform(0.25, 0.8),
+        mix=random.uniform(0.05, 0.3),
+    )
+
+
+def random_asymmetric_saturation(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+    return asymmetric_saturation_augment(
+        samples,
+        sample_rate,
+        positive_drive=random.uniform(1.4, 5.0),
+        negative_drive=random.uniform(1.1, 3.0),
+        mix=random.uniform(0.1, 0.5),
     )
 
 
@@ -247,7 +398,9 @@ def random_phaser(samples: np.ndarray, sample_rate: int) -> np.ndarray:
 
 class AudioAugmentor:
     """
-    オーディオ波形に対するデータ拡張（EQ、ピッチシフト(微小)、モジュレーション、リバーブ、ノイズ）を適用するクラス。
+    オーディオ波形に対するデータ拡張
+    （EQ、ピッチシフト(微小)、モジュレーション、歪み、リバーブ、ノイズ）
+    を適用するクラス。
     """
 
     def __init__(
@@ -261,6 +414,7 @@ class AudioAugmentor:
         snr_range: Tuple[float, float] = (3.0, 40.0),
         ir_folder: Optional[str | Path] = None,
         noise_folder: Optional[str | Path] = None,
+        distortion_augmentations: Optional[Tuple[str, ...] | list[str]] = None,
     ):
         try:
             from audiomentations import (
@@ -291,6 +445,9 @@ class AudioAugmentor:
         _load_pedalboard_modulation_plugins()
 
         self.sample_rate = sample_rate
+        self.distortion_augmentations = _validate_distortion_augmentations(
+            distortion_augmentations
+        )
 
         nyq = sample_rate / 2
         high_shelf_max = min(9000.0, nyq * 0.85)
@@ -438,6 +595,28 @@ class AudioAugmentor:
             p=0.25,
         )
 
+        # 1.9. dataset ごとに選択可能な歪み系 augmentation
+        distortion_transform_builders = {
+            "saturation": random_saturation,
+            "soft_clipping": random_soft_clipping,
+            "hard_clipping": random_hard_clipping,
+            "asymmetric_saturation": random_asymmetric_saturation,
+        }
+        if self.distortion_augmentations:
+            self.distortion_transform = OneOf(
+                transforms=[
+                    Lambda(
+                        transform=distortion_transform_builders[effect_name],
+                        p=1.0,
+                    )
+                    for effect_name in self.distortion_augmentations
+                ],
+                weights=[1.0] * len(self.distortion_augmentations),
+                p=0.3,
+            )
+        else:
+            self.distortion_transform = None
+
         # 2. リバーブ (IRコンボリューション)
         self.reverb = None
         if ir_folder is not None:
@@ -500,6 +679,10 @@ class AudioAugmentor:
 
         # 1.75. chorus/phaserなどのmodulation系
         x = self.modulation_transform(x, sample_rate=self.sample_rate)
+
+        # 1.9. dataset ごとに有効化された歪み系 augmentation
+        if self.distortion_transform is not None:
+            x = self.distortion_transform(x, sample_rate=self.sample_rate)
 
         # 2. リバーブ (Dry/Wetをランダムにブレンド)
         if self.reverb is not None:
