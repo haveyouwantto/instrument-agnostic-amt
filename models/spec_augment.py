@@ -18,6 +18,7 @@ class SpecAugment(nn.Module):
         num_freq_masks: int = 1,
         num_time_masks: int = 1,
         p: float = 1.0,
+        mask_fill_mode: str = "zero",
     ):
         """
         Args:
@@ -26,17 +27,23 @@ class SpecAugment(nn.Module):
             num_freq_masks (int): 適用する周波数マスクの最大数
             num_time_masks (int): 適用する時間マスクの最大数
             p (float): Augmentationを適用する確率
+            mask_fill_mode (str): マスク領域の埋め方
+                - "zero": 従来どおり 0 埋め
+                - "random": 正規分布ノイズで埋める
         """
         super().__init__()
         if freq_mask_max < 0:
             raise ValueError("freq_mask_max must be >= 0.")
         if time_mask_max < 0:
             raise ValueError("time_mask_max must be >= 0.")
+        if mask_fill_mode not in {"zero", "random"}:
+            raise ValueError("mask_fill_mode must be one of {'zero', 'random'}.")
         self.freq_mask_max = freq_mask_max
         self.time_mask_max = time_mask_max
         self.num_freq_masks = num_freq_masks
         self.num_time_masks = num_time_masks
         self.p = p
+        self.mask_fill_mode = mask_fill_mode
 
     @staticmethod
     def _resolve_spec_layout(spec: torch.Tensor):
@@ -53,6 +60,34 @@ class SpecAugment(nn.Module):
         raise ValueError(
             f"SpecAugment expects a 3D or 4D tensor, got shape {tuple(spec.shape)}."
         )
+
+    def _apply_mask(
+        self,
+        spec_4d: torch.Tensor,
+        *,
+        freq_mask: torch.Tensor,
+        time_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """収集したマスク位置へ、指定モードの埋め値を適用する。"""
+        aug_spec = spec_4d.clone()
+
+        if freq_mask.any():
+            freq_mask_4d = freq_mask[:, None, :, None]
+            if self.mask_fill_mode == "random":
+                freq_noise = torch.randn_like(aug_spec)
+                aug_spec = torch.where(freq_mask_4d, freq_noise, aug_spec)
+            else:
+                aug_spec = aug_spec.masked_fill(freq_mask_4d, 0.0)
+
+        if time_mask.any():
+            time_mask_4d = time_mask[:, None, None, :]
+            if self.mask_fill_mode == "random":
+                time_noise = torch.randn_like(aug_spec)
+                aug_spec = torch.where(time_mask_4d, time_noise, aug_spec)
+            else:
+                aug_spec = aug_spec.masked_fill(time_mask_4d, 0.0)
+
+        return aug_spec
 
     def forward(
         self, spec: torch.Tensor
@@ -76,9 +111,6 @@ class SpecAugment(nn.Module):
                 "time_mask": time_mask,
             }
 
-        # 元のスペクトログラムをコピーして変更
-        aug_spec = spec_4d.clone()
-
         for i in range(batch_size):
             # 周波数マスキング
             for _ in range(self.num_freq_masks):
@@ -88,7 +120,6 @@ class SpecAugment(nn.Module):
                 if f == 0:
                     continue
                 f0 = random.randint(0, num_mels - f)
-                aug_spec[i, :, f0 : f0 + f, :] = 0
                 freq_mask[i, f0 : f0 + f] = True
 
             # 時間マスキング
@@ -99,8 +130,15 @@ class SpecAugment(nn.Module):
                 if t == 0:
                     continue
                 t0 = random.randint(0, num_frames - t)
-                aug_spec[i, :, :, t0 : t0 + t] = 0
                 time_mask[i, t0 : t0 + t] = True
+
+        # 1. マスク位置をサンプリング
+        # 2. 最後にまとめて埋め値を適用する
+        aug_spec = self._apply_mask(
+            spec_4d,
+            freq_mask=freq_mask,
+            time_mask=time_mask,
+        )
 
         return restore_layout(aug_spec), {
             "freq_mask": freq_mask,

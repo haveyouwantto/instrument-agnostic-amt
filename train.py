@@ -400,6 +400,7 @@ def main():
         "num_freq_masks": args.sa_num_freq,
         "num_time_masks": args.sa_num_time,
         "p": args.sa_p,
+        "mask_fill_mode": "random",
     }
     config = SemiCRFModelConfig(
         sample_rate=dataset.sample_rate,
