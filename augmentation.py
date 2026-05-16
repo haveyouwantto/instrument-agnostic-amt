@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from scipy.ndimage import uniform_filter1d
+from scipy.signal import butter, sosfilt, sosfiltfilt
 import numpy as np
 
 
@@ -14,6 +15,8 @@ SUPPORTED_DISTORTION_AUGMENTATIONS = (
     "soft_clipping",
     "hard_clipping",
     "asymmetric_saturation",
+    "octaver",
+    "fuzz",
 )
 
 
@@ -243,6 +246,95 @@ def _blend_dry_wet(
     return _normalize_peak_if_needed(blended)
 
 
+def _apply_lowpass_filter(
+    samples: np.ndarray,
+    sample_rate: int,
+    *,
+    cutoff_hz: float,
+    order: int = 4,
+) -> np.ndarray:
+    """
+    波形へ Butterworth low-pass filter を適用する。
+
+    通常は zero-phase の filtfilt を使い、短すぎる波形だけ片方向フィルタへ
+    フォールバックする。
+    """
+    x = samples.astype(np.float32, copy=False)
+    nyquist = float(sample_rate) * 0.5
+    cutoff_hz = float(np.clip(cutoff_hz, 20.0, nyquist * 0.95))
+    sos = butter(int(order), cutoff_hz / nyquist, btype="low", output="sos")
+
+    # sosfiltfilt は短すぎる配列で失敗するので、その場合だけ sosfilt を使う。
+    axis_len = int(x.shape[-1])
+    n_sections = int(sos.shape[0])
+    padlen = 3 * max(1, 2 * n_sections)
+    if axis_len <= padlen:
+        filtered = sosfilt(sos, x, axis=-1)
+    else:
+        filtered = sosfiltfilt(sos, x, axis=-1)
+    return filtered.astype(np.float32, copy=False)
+
+
+def _build_suboctave_square(
+    samples: np.ndarray,
+    sample_rate: int,
+    cutoff_hz: float = 240.0,
+) -> np.ndarray:
+    """
+    簡易 sub-octave を生成する。
+
+    rising zero crossing ごとに極性を反転させることで、
+    元波形より 1 オクターブ下の矩形波に近い成分を作る。
+    """
+    x = samples.astype(np.float32, copy=False)
+    mono = x if x.ndim == 1 else np.mean(x, axis=0)
+    if mono.size == 0:
+        return x.copy()
+
+    # 1. rising zero crossing を見つける
+    rising_crossing = (mono[1:] >= 0.0) & (mono[:-1] < 0.0)
+    toggle = np.zeros_like(mono, dtype=np.int32)
+    toggle[1:] = rising_crossing.astype(np.int32, copy=False)
+    parity = np.cumsum(toggle, dtype=np.int32) % 2
+    square = 1.0 - 2.0 * parity.astype(np.float32, copy=False)
+
+    # 2. 元波形の包絡で音量を与える
+    env_win = max(1, int(sample_rate * 0.0025))
+    envelope = uniform_filter1d(np.abs(mono), size=env_win)
+    sub = square * envelope
+
+    # 3. 角を少し丸めてクリック感を弱める
+    smooth_win = max(1, int(sample_rate * 0.0015))
+    sub = uniform_filter1d(sub, size=smooth_win).astype(np.float32, copy=False)
+    sub = _apply_lowpass_filter(
+        sub,
+        sample_rate,
+        cutoff_hz=cutoff_hz,
+        order=4,
+    )
+
+    if x.ndim == 1:
+        return sub
+    return np.repeat(sub[None, :], x.shape[0], axis=0)
+
+
+def _build_octave_up_component(
+    samples: np.ndarray,
+    sample_rate: int,
+) -> np.ndarray:
+    """
+    簡易 octave-up 成分を生成する。
+
+    全波整流で倍周波を強めたあと、DC 成分を落として少し平滑化する。
+    """
+    x = samples.astype(np.float32, copy=False)
+    up = np.abs(x)
+    up = up - up.mean(axis=-1, keepdims=True)
+    smooth_win = max(1, int(sample_rate * 0.0008))
+    up = uniform_filter1d(up, size=smooth_win, axis=-1)
+    return up.astype(np.float32, copy=False)
+
+
 def _validate_distortion_augmentations(
     distortion_augmentations: Optional[Tuple[str, ...] | list[str]],
 ) -> tuple[str, ...]:
@@ -330,6 +422,59 @@ def asymmetric_saturation_augment(
     return _blend_dry_wet(x, wet, mix=mix)
 
 
+def octaver_augment(
+    samples: np.ndarray,
+    sample_rate: int,
+    down_mix: float = 0.18,
+    up_mix: float = 0.10,
+    mix: float = 1.0,
+) -> np.ndarray:
+    """
+    原音へ小さな sub-octave / octave-up 成分を加えた octaver 風の音を作る。
+    """
+    x = samples.astype(np.float32, copy=False)
+    wet = x.copy()
+
+    if down_mix > 0.0:
+        wet = wet + float(down_mix) * _build_suboctave_square(x, sample_rate)
+    if up_mix > 0.0:
+        wet = wet + float(up_mix) * _build_octave_up_component(x, sample_rate)
+
+    wet = _normalize_peak_if_needed(wet)
+    return _blend_dry_wet(x, wet, mix=mix)
+
+
+def fuzz_augment(
+    samples: np.ndarray,
+    sample_rate: int,
+    drive: float = 10.0,
+    threshold: float = 0.18,
+    bias: float = 0.03,
+    lowpass_cutoff_hz: float = 1800.0,
+    mix: float = 1.0,
+) -> np.ndarray:
+    """
+    波形を強く押し潰して、矩形波寄りの fuzz を作る。
+    """
+    del sample_rate
+    x = samples.astype(np.float32, copy=False)
+    drive = max(1.0, float(drive))
+    threshold = float(np.clip(threshold, 1e-3, 1.0))
+    bias = float(np.clip(bias, -0.25, 0.25))
+
+    preamped = drive * (x + bias)
+    saturated = np.tanh(preamped)
+    wet = np.clip(saturated, -threshold, threshold) / threshold
+    wet = np.tanh(1.5 * wet).astype(np.float32, copy=False)
+    wet = _apply_lowpass_filter(
+        wet,
+        sample_rate,
+        cutoff_hz=lowpass_cutoff_hz,
+        order=4,
+    )
+    return _blend_dry_wet(x, wet, mix=mix)
+
+
 def random_saturation(samples: np.ndarray, sample_rate: int) -> np.ndarray:
     return saturation_augment(
         samples,
@@ -365,6 +510,33 @@ def random_asymmetric_saturation(samples: np.ndarray, sample_rate: int) -> np.nd
         positive_drive=random.uniform(1.4, 5.0),
         negative_drive=random.uniform(1.1, 3.0),
         mix=random.uniform(0.1, 0.5),
+    )
+
+
+def random_octaver(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+    include_down = random.random() < 0.85
+    include_up = random.random() < 0.65
+    if not include_down and not include_up:
+        include_down = True
+
+    return octaver_augment(
+        samples,
+        sample_rate,
+        down_mix=(random.uniform(0.10, 0.28) if include_down else 0.0),
+        up_mix=(random.uniform(0.04, 0.16) if include_up else 0.0),
+        mix=random.uniform(0.25, 0.55),
+    )
+
+
+def random_fuzz(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+    return fuzz_augment(
+        samples,
+        sample_rate,
+        drive=random.uniform(6.0, 16.0),
+        threshold=random.uniform(0.10, 0.28),
+        bias=random.uniform(-0.05, 0.08),
+        lowpass_cutoff_hz=random.uniform(900.0, 2600.0),
+        mix=random.uniform(0.20, 0.55),
     )
 
 
@@ -601,6 +773,8 @@ class AudioAugmentor:
             "soft_clipping": random_soft_clipping,
             "hard_clipping": random_hard_clipping,
             "asymmetric_saturation": random_asymmetric_saturation,
+            "octaver": random_octaver,
+            "fuzz": random_fuzz,
         }
         if self.distortion_augmentations:
             self.distortion_transform = OneOf(
