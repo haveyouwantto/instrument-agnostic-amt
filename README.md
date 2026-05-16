@@ -330,6 +330,7 @@ python infer.py \
 | Argument | Default | Description |
 |---|---|---|
 | `--checkpoint` | (auto) | Path to the trained model. Automatically downloaded from HF if not provided |
+| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: fine-tuned for bass on top of the all-instruments model. |
 | `--audio` | (required) | Input audio path |
 | `--output-midi` | `<audio>.mid` | Output MIDI path |
 | `--amp` | `false` | Enable mixed precision inference |

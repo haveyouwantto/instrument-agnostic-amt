@@ -79,7 +79,13 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         type=Path,
         default=None,
-        help=f"Path to the trained model checkpoint (.pth). If not provided, downloads from Hugging Face to {DEFAULT_CHECKPOINT_PATH}.",
+        help=f"Path to the trained model checkpoint (.pth). If not provided, downloads from Hugging Face.",
+    )
+    parser.add_argument(
+        "--type",
+        choices=["default", "bass"],
+        default="default",
+        help="Type of the model to download from Hugging Face if checkpoint is not provided. 'default' for multi-instrument, 'bass' for bass-focused model.",
     )
 
     # 単一ファイルモード
@@ -211,16 +217,26 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def _ensure_checkpoint(checkpoint_path: Path | None) -> Path:
+def _ensure_checkpoint(checkpoint_path: Path | None, model_type: str = "default") -> Path:
     if checkpoint_path is None:
-        checkpoint_path = DEFAULT_CHECKPOINT_PATH
+        if model_type == "bass":
+            checkpoint_path = Path("checkpoints/best_model_bass.pth")
+            url = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main/best_model_bass.pth?download=true"
+        else:
+            checkpoint_path = DEFAULT_CHECKPOINT_PATH
+            url = DEFAULT_CHECKPOINT_URL
+    else:
+        if model_type == "bass":
+            url = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main/best_model_bass.pth?download=true"
+        else:
+            url = DEFAULT_CHECKPOINT_URL
 
     if not checkpoint_path.exists():
         print(
             f"Checkpoint not found at {checkpoint_path}. Downloading from Hugging Face..."
         )
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.hub.download_url_to_file(DEFAULT_CHECKPOINT_URL, str(checkpoint_path))
+        torch.hub.download_url_to_file(url, str(checkpoint_path))
 
     return checkpoint_path
 
@@ -1520,7 +1536,7 @@ def main() -> None:
     device = torch.device(args.device)
     amp_dtype = resolve_amp_dtype(device, args.amp_dtype)
 
-    checkpoint_path = _ensure_checkpoint(args.checkpoint)
+    checkpoint_path = _ensure_checkpoint(args.checkpoint, model_type=args.type)
     print(f"Loading checkpoint from {checkpoint_path}...")
     model, model_config, settings = _load_model_and_settings(
         checkpoint_path.resolve(),
