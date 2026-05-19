@@ -4,6 +4,7 @@ import random
 import math
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,7 @@ from torch.utils.data import Dataset
 
 from models.interval_boundaries import PitchIntervalTargets
 from augmentation import AudioAugmentor
-from instrument_classes import NUM_INSTRUMENT_CLASSES
+from instrument_classes import NUM_INSTRUMENT_CLASSES, get_instrument_class_id_by_name
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 NUM_PITCHES = 88
 MIN_MIDI_PITCH = 21
 MAX_MIDI_PITCH = 108
+PITCH_SHIFT_SUFFIX_RE = re.compile(r"^(?P<base>.+?)_pitch_(?P<shift>-?\d+)$")
 
 
 def _get_instrument_name(stem_name: str) -> str:
@@ -29,6 +31,190 @@ def _get_instrument_name(stem_name: str) -> str:
     parts = stem_name.split("__")
     inst_part = parts[-1] if len(parts) > 1 else stem_name
     return re.sub(r"_\d+$", "", inst_part)
+
+
+def _split_pitch_shift_suffix(name: str) -> tuple[str, int]:
+    """`_pitch_±n` の接尾辞を分離し、元名とシフト量を返す。"""
+    match = PITCH_SHIFT_SUFFIX_RE.match(name)
+    if match is None:
+        return name, 0
+    return match.group("base"), int(match.group("shift"))
+
+
+def _normalize_harmony_pitch_shifts(values: list[Any] | tuple[Any, ...]) -> tuple[int, ...]:
+    """YAML から読んだハモリ候補を順序付きの整数タプルへ正規化する。"""
+    normalized: list[int] = []
+    for value in values:
+        semitone = int(value)
+        if semitone == 0 or semitone in normalized:
+            continue
+        normalized.append(semitone)
+    return tuple(normalized)
+
+
+@dataclass(frozen=True)
+class HarmonyAugmentationConfig:
+    """疑似ハモリ生成に関する設定をまとめる。"""
+
+    pitch_shifts: tuple[int, ...] = ()
+    instrument_class_name: str | None = None
+    instrument_class_id: int | None = None
+    gain_db: float = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        """ハモリ候補が1つでもあれば有効とみなす。"""
+        return bool(self.pitch_shifts)
+
+    def describe(self) -> str:
+        """ログ表示用に設定内容を短く整形する。"""
+        if not self.enabled:
+            return "none"
+
+        parts = [f"shifts={self.pitch_shifts}"]
+        if self.instrument_class_name is not None:
+            parts.append(f"class={self.instrument_class_name}")
+        if self.gain_db != 0.0:
+            parts.append(f"gain_db={self.gain_db:+.1f}")
+        return ", ".join(parts)
+
+
+@dataclass(frozen=True)
+class StemMixSpec:
+    """1本のstemをどうミックスするかを表す。"""
+
+    stem: dict[str, Any]
+    # main stem からの相対 gain[dB]。
+    # harmony 側はここで main より小さくする。
+    gain_db_offset: float = 0.0
+    instrument_override_id: int | None = None
+
+    def override_instrument_ids(self, instrument_ids: np.ndarray) -> np.ndarray:
+        """必要なときだけ楽器ラベルを上書きする。"""
+        if self.instrument_override_id is None or instrument_ids.size == 0:
+            return instrument_ids
+        return np.full_like(
+            instrument_ids,
+            fill_value=int(self.instrument_override_id),
+        )
+
+
+def _build_harmony_augmentation_config(
+    dataset_entry: dict[str, Any] | None,
+) -> HarmonyAugmentationConfig:
+    """YAML設定からハモリ設定を構築する。"""
+    if dataset_entry is None:
+        return HarmonyAugmentationConfig()
+
+    instrument_class_name = dataset_entry.get("harmony_instrument_class_name")
+    if instrument_class_name is not None:
+        instrument_class_name = str(instrument_class_name).strip() or None
+
+    instrument_class_id = None
+    if instrument_class_name is not None:
+        instrument_class_id = get_instrument_class_id_by_name(instrument_class_name)
+
+    return HarmonyAugmentationConfig(
+        pitch_shifts=_normalize_harmony_pitch_shifts(
+            dataset_entry.get("harmony_pitch_shifts", []) or []
+        ),
+        instrument_class_name=instrument_class_name,
+        instrument_class_id=instrument_class_id,
+        gain_db=float(dataset_entry.get("harmony_gain_db", 0.0)),
+    )
+
+
+class HarmonyAugmentationManager:
+    """疑似ハモリstemの選択と付随処理をまとめる。"""
+
+    def __init__(
+        self,
+        *,
+        dataset_groups_by_name: dict[str, dict[str, Any]],
+        pitch_shift_stems_by_group: dict[tuple[str, str], dict[int, dict[str, Any]]],
+    ) -> None:
+        self.dataset_groups_by_name = dataset_groups_by_name
+        self.pitch_shift_stems_by_group = pitch_shift_stems_by_group
+
+    def _get_config(self, stem: dict[str, Any]) -> HarmonyAugmentationConfig:
+        """stem が属する dataset group のハモリ設定を返す。"""
+        group_name = str(stem.get("dataset_group_name", "main"))
+        group = self.dataset_groups_by_name.get(group_name)
+        if group is None:
+            return HarmonyAugmentationConfig()
+        config = group.get("harmony_config")
+        if not isinstance(config, HarmonyAugmentationConfig):
+            return HarmonyAugmentationConfig()
+        return config
+
+    def _resolve_harmony_stem(
+        self,
+        stem: dict[str, Any],
+        harmony_shift: int,
+    ) -> dict[str, Any] | None:
+        """同じ元stemの中から、相対ハモリに対応する pitch shift 版を探す。"""
+        group_name = str(stem.get("dataset_group_name", "main"))
+        pitch_shift_group_key = str(stem.get("pitch_shift_group_key", ""))
+        pitch_shift_group = self.pitch_shift_stems_by_group.get(
+            (group_name, pitch_shift_group_key)
+        )
+        if not pitch_shift_group:
+            return None
+
+        current_pitch_shift = int(stem.get("pitch_shift_value", 0))
+        for resolved_shift in (int(harmony_shift), -int(harmony_shift)):
+            target_pitch_shift = current_pitch_shift + resolved_shift
+            if target_pitch_shift == current_pitch_shift:
+                continue
+            harmony_stem = pitch_shift_group.get(target_pitch_shift)
+            if harmony_stem is not None:
+                return harmony_stem
+        return None
+
+    def _select_harmony_stem(
+        self,
+        stem: dict[str, Any],
+        harmony_config: HarmonyAugmentationConfig,
+        rng: random.Random,
+    ) -> dict[str, Any] | None:
+        """設定済み候補から1本だけハモリstemを選ぶ。"""
+        if not harmony_config.enabled:
+            return None
+
+        candidate_shifts = list(harmony_config.pitch_shifts)
+        rng.shuffle(candidate_shifts)
+        for harmony_shift in candidate_shifts:
+            harmony_stem = self._resolve_harmony_stem(stem, harmony_shift)
+            if harmony_stem is not None:
+                return harmony_stem
+        return None
+
+    def build_mix_specs(
+        self,
+        stem: dict[str, Any],
+        rng: random.Random,
+    ) -> list[StemMixSpec]:
+        """
+        元stemに加えて、必要なら疑似ハモリstemを含むミックス計画を返す。
+        """
+        mix_specs = [StemMixSpec(stem=stem)]
+        harmony_config = self._get_config(stem)
+        harmony_stem = self._select_harmony_stem(
+            stem,
+            harmony_config=harmony_config,
+            rng=rng,
+        )
+        if harmony_stem is None:
+            return mix_specs
+
+        mix_specs.append(
+            StemMixSpec(
+                stem=harmony_stem,
+                gain_db_offset=harmony_config.gain_db,
+                instrument_override_id=harmony_config.instrument_class_id,
+            )
+        )
+        return mix_specs
 
 
 class WindowNotes:
@@ -516,6 +702,8 @@ class StemDataset(Dataset):
 
         self.stems_by_song = defaultdict(list)
         self.all_stems = []
+        # 同じ元stemの pitch shift バリエーションを引くための索引
+        self.pitch_shift_stems_by_group: dict[tuple[str, str], dict[int, dict[str, Any]]] = defaultdict(dict)
 
         # データセットグループ: [{name, song_names, weight}, ...]
         self.dataset_groups: list[dict] = []
@@ -534,11 +722,20 @@ class StemDataset(Dataset):
                     "use_for_cross_aug": True,
                     "mask_instrument_loss": False,
                     "distortion_augmentations": (),
+                    "harmony_config": HarmonyAugmentationConfig(),
                 }
             )
             self.group_augmentors["main"] = self._build_audio_augmentor(
                 distortion_augmentations=()
             )
+
+        self.dataset_groups_by_name = {
+            str(group["name"]): group for group in self.dataset_groups
+        }
+        self.harmony_manager = HarmonyAugmentationManager(
+            dataset_groups_by_name=self.dataset_groups_by_name,
+            pitch_shift_stems_by_group=self.pitch_shift_stems_by_group,
+        )
 
         # primaryデータセット（最初のグループ）の曲名リスト
         self.primary_song_names = self.dataset_groups[0]["song_names"]
@@ -558,7 +755,8 @@ class StemDataset(Dataset):
                 f"weight={group['weight']}, prob={probability:.1f}%, "
                 f"cross_aug={group.get('use_for_cross_aug', True)}, "
                 f"mask_inst={group.get('mask_instrument_loss', False)}, "
-                f"distort={group.get('distortion_augmentations', ()) or 'none'}"
+                f"distort={group.get('distortion_augmentations', ()) or 'none'}, "
+                f"harmony={group.get('harmony_config', HarmonyAugmentationConfig()).describe()}"
             )
 
         # Cross augmentation用のグループと累積確率を計算
@@ -619,6 +817,7 @@ class StemDataset(Dataset):
             distortion_augmentations = tuple(
                 dataset_entry.get("distortion_augmentations", []) or []
             )
+            harmony_config = _build_harmony_augmentation_config(dataset_entry)
             existing_songs = set(self.stems_by_song.keys())
             self._load_manifest(
                 manifest_full,
@@ -642,6 +841,7 @@ class StemDataset(Dataset):
                         dataset_entry.get("mask_instrument_loss", False)
                     ),
                     "distortion_augmentations": distortion_augmentations,
+                    "harmony_config": harmony_config,
                 }
             )
             self.group_augmentors[str(dataset_name)] = self._build_audio_augmentor(
@@ -662,8 +862,16 @@ class StemDataset(Dataset):
             reader = csv.DictReader(f)
             for row in reader:
                 # CSV内のパスはマニフェストファイルからの相対パスなので解決する
-                wav_path = str(manifest_dir / row["wav_path"]).replace("\\", "/")
+                wav_rel_path = row["wav_path"].replace("\\", "/")
+                wav_path = str(manifest_dir / wav_rel_path).replace("\\", "/")
                 npz_path = str(manifest_dir / row["npz_path"]).replace("\\", "/")
+                wav_rel_no_suffix = Path(wav_rel_path).with_suffix("")
+                pitch_shift_base_name, pitch_shift_value = _split_pitch_shift_suffix(
+                    wav_rel_no_suffix.name
+                )
+                pitch_shift_group_key = (
+                    wav_rel_no_suffix.with_name(pitch_shift_base_name).as_posix()
+                )
                 # プレフィクス付きの曲名でデータセット間の名前衝突を防ぐ
                 song_name = row["song_name"]
                 if song_name_prefix:
@@ -678,9 +886,15 @@ class StemDataset(Dataset):
                     "note_count": int(row["note_count"]),
                     "mask_instrument_loss": mask_instrument_loss,
                     "dataset_group_name": str(dataset_group_name),
+                    "pitch_shift_value": pitch_shift_value,
+                    "pitch_shift_group_key": pitch_shift_group_key,
                 }
                 self.stems_by_song[song_name].append(stem_info)
                 self.all_stems.append(stem_info)
+                pitch_shift_group = self.pitch_shift_stems_by_group[
+                    (str(dataset_group_name), pitch_shift_group_key)
+                ]
+                pitch_shift_group[pitch_shift_value] = stem_info
 
     def set_epoch(self, epoch: int):
         """学習時のランダムシード制御用"""
@@ -798,49 +1012,60 @@ class StemDataset(Dataset):
 
         for stem, stem_window_start_ms in active_stems_with_offset:
             stem_window_end_ms = stem_window_start_ms + self.window_ms
-            wav_path = stem["wav_path"]
-            # 指定された確率でリバーブ処理済みステム(stems_augments)に差し替える
-            if rng.random() < self.p_use_stems_augments:
-                wav_path = wav_path.replace("stems/", "stems_augments/").replace(
-                    "stems\\", "stems_augments\\"
+            # 元stemと疑似ハモリstemの扱いをクラスへ寄せ、ここでは
+            # 「何をどう混ぜるか」だけを見る。
+            mix_specs = self.harmony_manager.build_mix_specs(stem, rng)
+            # 1つの元stemに対しては、まず main 側の gain を1回だけ決める。
+            # harmony 側はこの値を基準に相対オフセットで小さくする。
+            base_gain_db = rng.uniform(-6.0, 6.0)
+
+            for mix_spec in mix_specs:
+                mix_stem = mix_spec.stem
+                wav_path = mix_stem["wav_path"]
+                # 指定された確率でリバーブ処理済みステム(stems_augments)に差し替える
+                if rng.random() < self.p_use_stems_augments:
+                    wav_path = wav_path.replace("stems/", "stems_augments/").replace(
+                        "stems\\", "stems_augments\\"
+                    )
+
+                # 1. 音声を読み込んで拡張する
+                audio = load_audio_window(
+                    wav_path,
+                    sample_rate=self.sample_rate,
+                    window_start_ms=stem_window_start_ms,
+                    window_ms=self.window_ms,
                 )
+                stem_augmentor = self._get_stem_augmentor(mix_stem)
+                if stem_augmentor is not None and rng.random() < self.p_augment:
+                    audio = stem_augmentor(audio)
 
-            # 波形の読み込み
-            audio = load_audio_window(
-                wav_path,
-                sample_rate=self.sample_rate,
-                window_start_ms=stem_window_start_ms,
-                window_ms=self.window_ms,
-            )
-            # データ拡張 (EQ, マイクロチューニング, リバーブ, ノイズ)
-            stem_augmentor = self._get_stem_augmentor(stem)
-            if stem_augmentor is not None and rng.random() < self.p_augment:
-                audio = stem_augmentor(audio)
+                # 2. ミックス用の gain を決めて加算する。
+                #    harmony 側は main とは独立に乱数を振らず、必ず main 基準の
+                #    相対オフセットで扱う。
+                gain_db = base_gain_db + float(mix_spec.gain_db_offset)
+                gain = 10.0 ** (gain_db / 20.0)
+                mixed_audio += audio * gain
 
-            # 音量ランダム調整（-6dB 〜 6dB）
-            gain = 10.0 ** (rng.uniform(-6.0, 6.0) / 20.0)
-            mixed_audio += audio * gain
+                # 3. 対応するMIDI由来ラベルも同じウィンドウで読み込む
+                with np.load(mix_stem["npz_path"]) as data:
+                    start_ms = data["note_start_ms"]
+                    end_ms = data["note_end_ms"]
+                    pitch = data["note_pitch"]
+                    velocity = data["note_velocity"]
+                    instrument_ids = data.get("note_instrument", np.zeros_like(pitch))
+                    instrument_ids = mix_spec.override_instrument_ids(instrument_ids)
 
-            # 事前処理済みのノートを読み込む
-            with np.load(stem["npz_path"]) as data:
-                start_ms = data["note_start_ms"]
-                end_ms = data["note_end_ms"]
-                pitch = data["note_pitch"]
-                velocity = data["note_velocity"]
-                instrument_ids = data.get("note_instrument", np.zeros_like(pitch))
-
-            # 指定されたウィンドウに合わせてノートを切り出す
-            carry_in, body = split_window_notes(
-                start_ms=start_ms,
-                end_ms=end_ms,
-                pitch=pitch,
-                velocity=velocity,
-                instrument=instrument_ids,
-                window_start_ms=stem_window_start_ms,
-                window_end_ms=stem_window_end_ms,
-                clip_note_end_to_window=True,
-            )
-            note_groups.extend([carry_in, body])
+                carry_in, body = split_window_notes(
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    pitch=pitch,
+                    velocity=velocity,
+                    instrument=instrument_ids,
+                    window_start_ms=stem_window_start_ms,
+                    window_end_ms=stem_window_end_ms,
+                    clip_note_end_to_window=True,
+                )
+                note_groups.extend([carry_in, body])
 
         # 5. ドラム耐性向上のためのランダムドラム追加
         has_drum = any("drum" in inst.lower() for inst in base_instruments)
