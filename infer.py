@@ -178,6 +178,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--min-midi-note-ms",
+        type=float,
+        default=5.0,
+        help=(
+            "Extend very short exported MIDI notes up to this duration when possible. "
+            "Useful for preserving muted guitar notes without tick-quantization collapse. "
+            "Use 0 or a negative value to disable."
+        ),
+    )
+    parser.add_argument(
         "--max-midi-melodic-instruments",
         type=int,
         default=15,
@@ -217,7 +227,9 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def _ensure_checkpoint(checkpoint_path: Path | None, model_type: str = "default") -> Path:
+def _ensure_checkpoint(
+    checkpoint_path: Path | None, model_type: str = "default"
+) -> Path:
     if checkpoint_path is None:
         if model_type == "bass":
             checkpoint_path = Path("checkpoints/best_model_bass.pth")
@@ -475,7 +487,9 @@ class PitchFirstNoteStitcher:
         if valid_model_frames <= 0:
             return [0] * int(num_pitches)
 
-        window_model_start = int(round(float(window_start_frame) / float(self.hop_length)))
+        window_model_start = int(
+            round(float(window_start_frame) / float(self.hop_length))
+        )
         return [
             max(
                 0,
@@ -499,7 +513,9 @@ class PitchFirstNoteStitcher:
     ) -> None:
         """1ウィンドウ分の区間を取り込み、継続ノート状態を更新する。"""
         self._ensure_pitch_state(len(intervals_by_pitch))
-        window_model_start = int(round(float(window_start_frame) / float(self.hop_length)))
+        window_model_start = int(
+            round(float(window_start_frame) / float(self.hop_length))
+        )
 
         for pitch_index, pitch_intervals in enumerate(intervals_by_pitch):
             midi_pitch = int(MIN_MIDI_PITCH + pitch_index)
@@ -530,7 +546,9 @@ class PitchFirstNoteStitcher:
                 if note is None:
                     continue
 
-                if pitch_notes and int(note.start_frame) < int(pitch_notes[-1].end_frame):
+                if pitch_notes and int(note.start_frame) < int(
+                    pitch_notes[-1].end_frame
+                ):
                     if note.has_onset:
                         pitch_notes[-1] = note
                     else:
@@ -549,8 +567,8 @@ class PitchFirstNoteStitcher:
                     local_last_closed_frame = int(end_frame)
 
             if local_last_closed_frame is not None:
-                self.last_closed_global_frames[pitch_index] = (
-                    window_model_start + int(local_last_closed_frame)
+                self.last_closed_global_frames[pitch_index] = window_model_start + int(
+                    local_last_closed_frame
                 )
 
     def finalize(self) -> list[PredictedNote]:
@@ -644,11 +662,13 @@ class PitchFirstNoteStitcher:
         valid_model_frames: int,
     ) -> PredictedNote | None:
         """1つの decode 区間を、stitch 用ノート候補へ変換する。"""
-        has_onset, has_offset, onset_off, offset_off = self._resolve_interval_boundary_flags(
-            begin_frame=int(begin_frame),
-            end_frame=int(end_frame),
-            valid_model_frames=int(valid_model_frames),
-            boundary_flag=boundary_flag,
+        has_onset, has_offset, onset_off, offset_off = (
+            self._resolve_interval_boundary_flags(
+                begin_frame=int(begin_frame),
+                end_frame=int(end_frame),
+                valid_model_frames=int(valid_model_frames),
+                boundary_flag=boundary_flag,
+            )
         )
 
         start_frame = window_start_frame + int(
@@ -671,11 +691,13 @@ class PitchFirstNoteStitcher:
         if start_frame >= window_valid_end:
             return None
 
-        instrument_prob_sum, instrument_frame_count = self._extract_interval_instrument_stats(
-            instrument_logits=instrument_logits,
-            begin_frame=int(begin_frame),
-            end_frame=int(end_frame),
-            pitch_index=int(pitch_index),
+        instrument_prob_sum, instrument_frame_count = (
+            self._extract_interval_instrument_stats(
+                instrument_logits=instrument_logits,
+                begin_frame=int(begin_frame),
+                end_frame=int(end_frame),
+                pitch_index=int(pitch_index),
+            )
         )
         return PredictedNote(
             pitch=int(MIN_MIDI_PITCH + pitch_index),
@@ -769,7 +791,9 @@ class PitchFirstNoteStitcher:
             ),
         )
 
-    def _assign_note_instruments(self, notes: list[PredictedNote]) -> list[PredictedNote]:
+    def _assign_note_instruments(
+        self, notes: list[PredictedNote]
+    ) -> list[PredictedNote]:
         """集約済みの楽器確率から、最終的な楽器IDと候補順を確定する。"""
         finalized_notes: list[PredictedNote] = []
         for note in notes:
@@ -788,7 +812,9 @@ class PitchFirstNoteStitcher:
             note_probs = note.instrument_prob_sum / float(note.instrument_frame_count)
             order = np.argsort(-note_probs.astype(np.float64, copy=False))
             instrument_candidates = tuple(int(index) for index in order.tolist())
-            instrument_id = int(instrument_candidates[0]) if instrument_candidates else 0
+            instrument_id = (
+                int(instrument_candidates[0]) if instrument_candidates else 0
+            )
             finalized_notes.append(
                 replace(
                     note,
@@ -902,6 +928,55 @@ def _truncate_overlapping_notes(
     )
 
 
+def _enforce_minimum_note_duration(
+    notes: list[PredictedNote],
+    *,
+    min_duration_frames: int,
+    min_separation_frames: int = 0,
+) -> list[PredictedNote]:
+    if not notes or min_duration_frames <= 1:
+        return notes
+
+    ordered_notes = sorted(
+        notes,
+        key=lambda note: (
+            note.pitch,
+            note.start_frame,
+            note.end_frame,
+        ),
+    )
+    by_pitch: dict[int, list[PredictedNote]] = defaultdict(list)
+    for note in ordered_notes:
+        by_pitch[int(note.pitch)].append(note)
+
+    adjusted_notes: list[PredictedNote] = []
+    for pitch_notes in by_pitch.values():
+        for note_index, note in enumerate(pitch_notes):
+            target_end_frame = max(
+                int(note.end_frame),
+                int(note.start_frame) + int(min_duration_frames),
+            )
+            if note_index + 1 < len(pitch_notes):
+                next_note = pitch_notes[note_index + 1]
+                latest_safe_end_frame = int(next_note.start_frame) - int(
+                    min_separation_frames
+                )
+                target_end_frame = min(target_end_frame, latest_safe_end_frame)
+            if target_end_frame <= int(note.start_frame):
+                adjusted_notes.append(note)
+                continue
+            adjusted_notes.append(replace(note, end_frame=int(target_end_frame)))
+
+    return sorted(
+        adjusted_notes,
+        key=lambda note: (
+            note.start_frame,
+            note.pitch,
+            note.end_frame,
+        ),
+    )
+
+
 def _filter_long_notes(
     notes: list[PredictedNote],
     *,
@@ -1008,12 +1083,16 @@ def _build_midi(
     notes: list[PredictedNote],
     *,
     sample_rate: int,
+    min_midi_note_ms: float = 5.0,
 ) -> pretty_midi.PrettyMIDI:
     from instrument_classes import INSTRUMENT_CLASSES, get_program_number_from_class_id
 
-    # Use a higher PPQ so very short muted guitar notes do not collapse onto the
-    # same MIDI tick and accidentally merge with later note-off events.
     midi = pretty_midi.PrettyMIDI(resolution=1920)
+    min_midi_note_frames = max(
+        0,
+        int(round(float(min_midi_note_ms) * float(sample_rate) / 1000.0)),
+    )
+    min_separation_frames = max(1, int(round(float(sample_rate) * 0.005)))
 
     notes_by_inst: dict[int, list[PredictedNote]] = {}
     for note in notes:
@@ -1034,7 +1113,12 @@ def _build_midi(
         inst_notes = _truncate_overlapping_notes(
             inst_notes,
             separate_adjacent_same_pitch=True,
-            min_separation_frames=max(1, int(round(float(sample_rate) * 0.005))),
+            min_separation_frames=min_separation_frames,
+        )
+        inst_notes = _enforce_minimum_note_duration(
+            inst_notes,
+            min_duration_frames=min_midi_note_frames,
+            min_separation_frames=min_separation_frames,
         )
         for note in inst_notes:
             instrument.notes.append(
@@ -1487,7 +1571,11 @@ def _process_single_file(
         disable_tqdm=bool(args.disable_tqdm),
     )
 
-    midi = _build_midi(notes, sample_rate=int(model_config.sample_rate))
+    midi = _build_midi(
+        notes,
+        sample_rate=int(model_config.sample_rate),
+        min_midi_note_ms=float(args.min_midi_note_ms),
+    )
 
     # メタデータの埋め込み
     if aggregated_logits and not (args.disable_beat and args.disable_chord):
