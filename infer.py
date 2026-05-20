@@ -70,6 +70,29 @@ SUPPORTED_AUDIO_EXTENSIONS = {
     ".aif",
 }
 
+DEFAULT_INSTRUMENT_VOLUMES: dict[str, int] = {
+    "piano": 105,
+    "electric_piano": 96,
+    "acoustic_guitar": 88,
+    "electric_guitar_clean": 84,
+    "distorted_guitar": 78,
+    "electric_guitar_muted": 68,
+    "guitar_harmonics": 72,
+    "acoustic_bass": 92,
+    "electric_bass": 90,
+    "synth_bass": 86,
+    "drums": 100,
+    "strings": 82,
+    "brass": 84,
+    "sax": 86,
+    "flute_pipe": 84,
+    "choir": 80,
+    "organ": 88,
+    "synth_pad": 76,
+    "synth_lead": 84,
+    "melody": 98,
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -169,6 +192,17 @@ def parse_args() -> argparse.Namespace:
         help="Constant MIDI velocity for predicted notes.",
     )
     parser.add_argument(
+        "--instrument-volume",
+        action="append",
+        default=[],
+        metavar="CLASS=VALUE",
+        help=(
+            "Set MIDI CC7 volume (0-127) for a specific instrument class. "
+            "Repeatable, e.g. --instrument-volume piano=90 --instrument-volume guitar=70. "
+            "If omitted, a built-in per-instrument default mix is used."
+        ),
+    )
+    parser.add_argument(
         "--max-note-seconds",
         type=float,
         default=15.0,
@@ -224,7 +258,57 @@ def parse_args() -> argparse.Namespace:
             "--output-midi cannot be used with --audio-dir. Use --output-dir instead."
         )
 
+    try:
+        args.instrument_volume_map = _parse_instrument_volume_args(
+            args.instrument_volume
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
     return args
+
+
+def _normalize_instrument_class_name(name: str) -> str:
+    return name.strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _parse_instrument_volume_args(entries: list[str]) -> dict[str, int]:
+    if not entries:
+        return dict(DEFAULT_INSTRUMENT_VOLUMES)
+
+    from instrument_classes import INSTRUMENT_CLASSES
+
+    available_names = {
+        _normalize_instrument_class_name(class_name): class_name
+        for class_name in INSTRUMENT_CLASSES
+    }
+    volume_map: dict[str, int] = {}
+
+    for entry in entries:
+        if "=" not in entry:
+            raise ValueError(
+                f"Invalid --instrument-volume '{entry}'. Expected CLASS=VALUE."
+            )
+        raw_name, raw_value = entry.split("=", 1)
+        class_key = _normalize_instrument_class_name(raw_name)
+        if class_key not in available_names:
+            available = ", ".join(sorted(available_names.keys()))
+            raise ValueError(
+                f"Unknown instrument class '{raw_name}'. Available classes: {available}"
+            )
+        try:
+            volume = int(raw_value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid volume '{raw_value}' for instrument '{raw_name}'."
+            ) from exc
+        if not 0 <= volume <= 127:
+            raise ValueError(
+                f"Volume for instrument '{raw_name}' must be in the range 0-127."
+            )
+        volume_map[class_key] = volume
+
+    return volume_map
 
 
 def _ensure_checkpoint(
@@ -1089,10 +1173,13 @@ def _build_midi(
     *,
     sample_rate: int,
     min_midi_note_ms: float = 5.0,
+    instrument_volumes: dict[str, int] | None = None,
 ) -> pretty_midi.PrettyMIDI:
     from instrument_classes import INSTRUMENT_CLASSES, get_program_number_from_class_id
 
     midi = pretty_midi.PrettyMIDI(resolution=1920)
+    short_note_velocity_threshold_ms = 30.0
+    short_note_velocity_scale = 0.5
     min_midi_note_frames = max(
         0,
         int(round(float(min_midi_note_ms) * float(sample_rate) / 1000.0)),
@@ -1115,6 +1202,15 @@ def _build_midi(
         instrument = pretty_midi.Instrument(
             program=prog_num, is_drum=is_drum, name=class_name
         )
+        class_key = _normalize_instrument_class_name(class_name)
+        if instrument_volumes and class_key in instrument_volumes:
+            instrument.control_changes.append(
+                pretty_midi.ControlChange(
+                    number=7,
+                    value=int(instrument_volumes[class_key]),
+                    time=0.0,
+                )
+            )
         inst_notes = _truncate_overlapping_notes(
             inst_notes,
             separate_adjacent_same_pitch=True,
@@ -1126,9 +1222,18 @@ def _build_midi(
             min_separation_frames=min_separation_frames,
         )
         for note in inst_notes:
+            duration_ms = (
+                float(int(note.end_frame) - int(note.start_frame)) * 1000.0
+            ) / float(sample_rate)
+            velocity = int(note.velocity)
+            if duration_ms <= short_note_velocity_threshold_ms:
+                velocity = max(
+                    1,
+                    min(127, int(round(float(velocity) * short_note_velocity_scale))),
+                )
             instrument.notes.append(
                 pretty_midi.Note(
-                    velocity=int(note.velocity),
+                    velocity=velocity,
                     pitch=int(note.pitch),
                     start=float(note.start_frame) / float(sample_rate),
                     end=float(note.end_frame) / float(sample_rate),
@@ -1580,6 +1685,7 @@ def _process_single_file(
         notes,
         sample_rate=int(model_config.sample_rate),
         min_midi_note_ms=float(args.min_midi_note_ms),
+        instrument_volumes=dict(args.instrument_volume_map),
     )
 
     # メタデータの埋め込み
