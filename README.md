@@ -21,6 +21,20 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 
 > **Warning**: Generalization to electric guitar (especially with distortion) is still weak, and transcription accuracy tends to be lower. The same applies to ethnic instruments (e.g. shamisen, sitar) that are underrepresented in the training data.
 
+### Changelog
+
+| Date | Update |
+|---|---|
+| 2026-05-20 | 🎸 Added guitar-focused model (`--type guitar`) |
+| 2026-05-18 | 📦 Added pitch-shift / time-stretch preprocessing scripts |
+| 2026-05-17 | 🎤 Added vocal-focused model (`--type vocal`) |
+| 2026-05-16 | 🎸 Added bass-focused model (`--type bass`) |
+| 2026-05-09 | 🔧 Fixed cross-window note stitching / Added beat & chord training |
+| 2026-05-09 | 🎼 Added stem-separated transcription workflow to Colab |
+| 2026-05-06 | 🥁 Improved drum detection / Added new augmentations |
+| 2026-05-05 | ✨ Added EMA, instrument loss masking, batch directory inference |
+| 2026-05-03 | 🚀 Initial release — multi-instrument AMT model & Colab notebook |
+
 ### Features
 
 - 🎹 **Works with any instrument** — Piano, guitar, bass, vocals, strings, wind instruments, and more
@@ -330,7 +344,7 @@ python infer.py \
 | Argument | Default | Description |
 |---|---|---|
 | `--checkpoint` | (auto) | Path to the trained model. Automatically downloaded from HF if not provided |
-| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: fine-tuned for bass. `vocal`: fine-tuned for vocal. |
+| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: fine-tuned for bass. `vocal`: fine-tuned for vocal. `guitar`: fine-tuned for guitar. |
 | `--audio` | (required) | Input audio path |
 | `--output-midi` | `<audio>.mid` | Output MIDI path |
 | `--amp` | `false` | Enable mixed precision inference |
