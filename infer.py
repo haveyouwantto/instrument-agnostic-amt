@@ -1011,7 +1011,9 @@ def _build_midi(
 ) -> pretty_midi.PrettyMIDI:
     from instrument_classes import INSTRUMENT_CLASSES, get_program_number_from_class_id
 
-    midi = pretty_midi.PrettyMIDI()
+    # Use a higher PPQ so very short muted guitar notes do not collapse onto the
+    # same MIDI tick and accidentally merge with later note-off events.
+    midi = pretty_midi.PrettyMIDI(resolution=1920)
 
     notes_by_inst: dict[int, list[PredictedNote]] = {}
     for note in notes:

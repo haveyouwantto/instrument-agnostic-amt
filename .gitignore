@@ -230,6 +230,7 @@ other_db/
 results/
 IRs/
 checkpoints/
+checkpoints_overlap/
 dataset_config.yaml
 *.yaml
 .codex
