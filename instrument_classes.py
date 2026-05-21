@@ -14,7 +14,7 @@ if not _MERGE_JSON_PATH.exists():
 # 既存の33楽器クラスは sorted(labels.keys()) のIDで保存済みnpzに入っている。
 # 新しい非GMクラスは末尾に追加して、既存IDをずらさない。
 EXTRA_INSTRUMENT_CLASS_PROGRAMS = {
-    "melody": 65,  # 推論結果をMIDIに戻すときの代表音色は Alto Sax にする。
+    "melody": 88,  # 推論結果をMIDIに戻すときの代表音色は88 (Synth Vox) にする。
 }
 
 INSTRUMENT_CLASSES: List[str] = []
@@ -63,8 +63,9 @@ def _load_instrument_mappings() -> None:
     _CLASS_NAME_TO_ID = {name: idx for idx, name in enumerate(INSTRUMENT_CLASSES)}
 
     for class_name, class_info in labels.items():
+        default_member = class_info.get("default_member")
         class_id = _CLASS_NAME_TO_ID[class_name]
-        for member in class_info.get("members", []):
+        for i, member in enumerate(class_info.get("members", [])):
             if member.get("instrument_key") == "drums" or class_name == "drums":
                 _DRUM_CLASS_ID = class_id
 
@@ -74,7 +75,9 @@ def _load_instrument_mappings() -> None:
 
             prog_num = int(prog_num)
             _PROGRAM_TO_CLASS_ID[prog_num] = class_id
-            _CLASS_ID_TO_PROGRAM.setdefault(class_id, prog_num)
+
+            if i == 0 or default_member == i:
+                _CLASS_ID_TO_PROGRAM.setdefault(class_id, prog_num)
 
     # melody はGM programから自動判定するクラスではない。
     # prepare_dataset.py 側でトラック名を見て明示的にこのクラスへ割り当てる。

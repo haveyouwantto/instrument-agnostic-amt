@@ -12,6 +12,56 @@ from stem_splitter.inference import SeparationConfig, _separate_one_file, load_m
 from adtof_pytorch import transcribe_to_midi
 
 
+INSTRUMENT_CLASS_GAIN: dict[str, int] = {
+    # 打击乐与节奏组
+    "drums": 88,                   # 鼓组会有很多高频的镲片声，要稍微调低一点
+    "timpani": 115,                # 定音鼓是厚重的低音基石，要给它多多的力气
+    "chromatic_percussion": 100,   # 钢片琴等音色比较纯净，保持中间位置
+    "percussive_fx": 75,           # 敲击特效通常噪音多，要压低
+
+    # 键盘类乐器
+    "piano": 102,                  # 钢琴是全能选手，稍微抬高一点点保证清晰度
+    "electric_piano": 100,         # 电钢琴声音通常比较圆润，保持中值
+    "plucked_keyboard": 85,        # 拨弦古钢琴（羽管键琴）泛音太亮，要调低
+    "organ": 74,                   # 管风琴是“泛音之王”，声音太厚了，必须压低
+    "accordion_family": 78,        # 手风琴家族声音很扁且泛音多，调低一点
+    "harmonica": 82,               # 口琴的高频比较尖锐，调低
+    
+    # 吉他类乐器（这里是高频噪音的“重灾区”喔）
+    "acoustic_guitar": 82,         # 木吉他拨弦声很亮，要压低
+    "electric_guitar_clean": 78,   # 清音电吉他也要温柔一点
+    "electric_guitar_muted": 85,   # 闷音吉他高频被滤掉了，可以比清音稍微大一点
+    "distorted_guitar": 65,        # 失真吉他全身都是噪点，必须狠狠压住
+    "guitar_harmonics": 60,        # 这种纯粹的高频泛音最扎耳朵了，要最细小
+
+    # 低音类乐器（泛音很少，需要抬高来撑场面）
+    "acoustic_bass": 110,          # 原声贝斯需要很强的力量感
+    "electric_bass": 108,          # 电贝斯也是音乐的底盘
+    "slap_bass": 95,               # 勾击贝斯会有金属撞击声，比普通贝斯低一点
+    "synth_bass": 98,              # 合成器贝斯通常自带很多修饰，稍微压一点点
+
+    # 弦乐与管弦乐类
+    "strings": 78,                 # 弦乐合奏泛音非常复杂，压低避免浑浊
+    "pizzicato_strings": 88,       # 拨弦效果比拉弦清脆，可以稍大一点
+    "orchestral_harp": 95,         # 竖琴很温柔，比钢琴小一点点就好
+    "orchestra_hit": 60,           # 这种大合奏音效全是噪音，要调到非常低
+    "choir": 72,                   # 合唱团是很多人声叠在一起，要非常小声才和谐
+    "brass": 76,                   # 铜管乐器非常刺耳，要大幅调低
+    "sax": 80,                     # 萨克斯风也是很有穿透力的，要压住
+    "orchestral_woodwind": 88,     # 综合木管组通常比较柔和，中等偏下
+    "flute_pipe": 110,             # 长笛声音最纯正（接近正弦波），要抬高
+
+    # 合成器与特效
+    "synth_lead": 76,              # 领奏合成器通常太尖，调低
+    "synth_pad": 88,               # 铺底音色不能抢戏，调低
+    "synth_fx": 70,                # 合成器特效大多是噪音，调低
+    "ethnic": 85,                  # 民族乐器通常带有一些独特的共鸣，调低
+    "sound_fx": 65,                # 纯粹的音效（比如开门声）通常很吵，调低
+
+    "melody": 120,                 # 这是我们为 AMT 结果单独设定的“旋律”类
+}
+
+
 # セッション中にモデルを使い回して、再実行時の待ち時間を減らす。
 STEM_PIPELINE_CACHE = {}
 
@@ -299,7 +349,7 @@ def run_stem_separated_transcription(
             max_note_seconds=15.0
         )
 
-        midi = infer._build_midi(notes, sample_rate=current_amt_config.sample_rate)
+        midi = infer._build_midi(notes, sample_rate=current_amt_config.sample_rate, instrument_volumes=INSTRUMENT_CLASS_GAIN)
         midi.write(str(output_midi))
         song_midi_paths.append(output_midi)
 
