@@ -14,7 +14,7 @@ if not _MERGE_JSON_PATH.exists():
 # 既存の33楽器クラスは sorted(labels.keys()) のIDで保存済みnpzに入っている。
 # 新しい非GMクラスは末尾に追加して、既存IDをずらさない。
 EXTRA_INSTRUMENT_CLASS_PROGRAMS = {
-    "melody": 88,  # 推論結果をMIDIに戻すときの代表音色は88 (Synth Vox) にする。
+    "melody": 85,  # 推論結果をMIDIに戻すときの代表音色は88 (Synth Vox) にする。
 }
 
 INSTRUMENT_CLASSES: List[str] = []
