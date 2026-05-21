@@ -64,6 +64,7 @@ def _load_instrument_mappings() -> None:
 
     for class_name, class_info in labels.items():
         default_member = class_info.get("default_member")
+        default_idx = int(default_member) if default_member is not None else 0
         class_id = _CLASS_NAME_TO_ID[class_name]
         for i, member in enumerate(class_info.get("members", [])):
             if member.get("instrument_key") == "drums" or class_name == "drums":
@@ -76,8 +77,8 @@ def _load_instrument_mappings() -> None:
             prog_num = int(prog_num)
             _PROGRAM_TO_CLASS_ID[prog_num] = class_id
 
-            if i == 0 or default_member == i:
-                _CLASS_ID_TO_PROGRAM.setdefault(class_id, prog_num)
+            if i == default_idx:
+                _CLASS_ID_TO_PROGRAM[class_id] = prog_num
 
     # melody はGM programから自動判定するクラスではない。
     # prepare_dataset.py 側でトラック名を見て明示的にこのクラスへ割り当てる。

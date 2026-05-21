@@ -369,6 +369,7 @@
       "midi_file_count": 8761,
       "note_count": 6423268,
       "part_count": 12367,
+      "default_member": 1,
       "members": [
         {
           "instrument_key": "26",
@@ -419,6 +420,7 @@
       "midi_file_count": 7104,
       "note_count": 6137449,
       "part_count": 12964,
+      "default_member": 1,
       "members": [
         {
           "instrument_key": "29",
@@ -589,6 +591,7 @@
       "midi_file_count": 13242,
       "note_count": 5125859,
       "part_count": 22178,
+      "default_member": 5,
       "members": [
         {
           "instrument_key": "40",
@@ -809,6 +812,7 @@
       "midi_file_count": 6391,
       "note_count": 2757124,
       "part_count": 10253,
+      "default_member": 5,
       "members": [
         {
           "instrument_key": "56",
@@ -899,6 +903,7 @@
       "midi_file_count": 4798,
       "note_count": 1554874,
       "part_count": 6136,
+      "default_member": 1,
       "members": [
         {
           "instrument_key": "64",
@@ -999,6 +1004,7 @@
       "midi_file_count": 5277,
       "note_count": 1650156,
       "part_count": 6489,
+      "default_member": 1,
       "members": [
         {
           "instrument_key": "72",
