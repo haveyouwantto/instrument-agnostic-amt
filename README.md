@@ -216,19 +216,6 @@ python preprocess/resample_only.py \
   --target_sr 22050
 ```
 
-### 4. (Optional) Offline reverb
-
-Pre-generate reverb-processed stem variants for training:
-
-```bash
-python preprocess/apply_ir_augmentation.py \
-  --stems_dir ./stems \
-  --ir_dir ./IRs \
-  --output_dir ./stems_augments
-```
-
----
-
 ## Training
 
 ### Quick start
@@ -258,7 +245,6 @@ python train.py \
   --p_augment 1.0 \
   --p_intra_drop 0.3 \
   --p_cross_mix 0.5 \
-  --p_use_stems_augments 0.5 \
   --p_drum_mix 0.1 \
   --sa_p 0.5 --sa_freq_max 10 --sa_time_max 20 --sa_num_freq 2 --sa_num_time 2 \
   --wandb --project_name instrument_agnostic_amt
@@ -276,7 +262,6 @@ python train.py \
 | `--p_intra_drop` | `0.3` | Probability of dropping stems from the same song |
 | `--p_cross_mix` | `0.5` | Probability of mixing in stems from other songs |
 | `--p_augment` | `1.0` | Probability of applying audio augmentation |
-| `--p_use_stems_augments` | `0.5` | Probability of using reverb-processed stems |
 | `--init-from` | `None` | Checkpoint for weight initialization |
 | `--no_amp` | `false` | Disable mixed precision |
 

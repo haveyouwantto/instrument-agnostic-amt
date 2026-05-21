@@ -655,7 +655,6 @@ class StemDataset(Dataset):
         p_cross_mix_decay: float = 0.3,
         max_cross_stems: int = 5,
         p_augment: float = 0.5,
-        p_use_stems_augments: float = 0.0,
         ir_folder: str | Path | None = None,
         noise_folder: str | Path | None = None,
         drum_folder: str | Path | None = None,
@@ -674,7 +673,6 @@ class StemDataset(Dataset):
         self.p_cross_mix_decay = float(p_cross_mix_decay)
         self.max_cross_stems = int(max_cross_stems)
         self.p_augment = float(p_augment)
-        self.p_use_stems_augments = float(p_use_stems_augments)
         self.seed = int(seed)
         self.epoch = 0
         self.ir_folder = ir_folder
@@ -1021,16 +1019,10 @@ class StemDataset(Dataset):
 
             for mix_spec in mix_specs:
                 mix_stem = mix_spec.stem
-                wav_path = mix_stem["wav_path"]
-                # 指定された確率でリバーブ処理済みステム(stems_augments)に差し替える
-                if rng.random() < self.p_use_stems_augments:
-                    wav_path = wav_path.replace("stems/", "stems_augments/").replace(
-                        "stems\\", "stems_augments\\"
-                    )
 
                 # 1. 音声を読み込んで拡張する
                 audio = load_audio_window(
-                    wav_path,
+                    mix_stem["wav_path"],
                     sample_rate=self.sample_rate,
                     window_start_ms=stem_window_start_ms,
                     window_ms=self.window_ms,
