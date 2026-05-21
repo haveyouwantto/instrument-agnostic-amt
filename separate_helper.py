@@ -31,8 +31,8 @@ INSTRUMENT_CLASS_GAIN: dict[str, int] = {
     "acoustic_guitar": 82,         # 木吉他拨弦声很亮，要压低
     "electric_guitar_clean": 78,   # 清音电吉他也要温柔一点
     "electric_guitar_muted": 85,   # 闷音吉他高频被滤掉了，可以比清音稍微大一点
-    "distorted_guitar": 65,        # 失真吉他全身都是噪点，必须狠狠压住
-    "guitar_harmonics": 60,        # 这种纯粹的高频泛音最扎耳朵了，要最细小
+    "distorted_guitar": 70,        # 失真吉他全身都是噪点，必须狠狠压住
+    "guitar_harmonics": 68,        # 这种纯粹的高频泛音最扎耳朵了，要最细小
 
     # 低音类乐器（泛音很少，需要抬高来撑场面）
     "acoustic_bass": 110,          # 原声贝斯需要很强的力量感
@@ -56,7 +56,7 @@ INSTRUMENT_CLASS_GAIN: dict[str, int] = {
     "synth_pad": 88,               # 铺底音色不能抢戏，调低
     "synth_fx": 70,                # 合成器特效大多是噪音，调低
     "ethnic": 85,                  # 民族乐器通常带有一些独特的共鸣，调低
-    "sound_fx": 65,                # 纯粹的音效（比如开门声）通常很吵，调低
+    "sound_fx": 70,                # 纯粹的音效（比如开门声）通常很吵，调低
 
     "melody": 120,                 # 这是我们为 AMT 结果单独设定的“旋律”类
 }
