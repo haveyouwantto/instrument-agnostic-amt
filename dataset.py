@@ -13,6 +13,7 @@ import soundfile as sf
 import torch
 from torch.utils.data import Dataset
 
+from dataset_sampling import StemWindowSelector
 from models.interval_boundaries import PitchIntervalTargets
 from augmentation import AudioAugmentor
 from instrument_classes import NUM_INSTRUMENT_CLASSES, get_instrument_class_id_by_name
@@ -718,6 +719,8 @@ class StemDataset(Dataset):
                     "song_names": primary_songs,
                     "weight": 1.0,
                     "use_for_cross_aug": True,
+                    "active_window_sampling": False,
+                    "allow_multi_stem_same_song": True,
                     "mask_instrument_loss": False,
                     "distortion_augmentations": (),
                     "harmony_config": HarmonyAugmentationConfig(),
@@ -733,6 +736,11 @@ class StemDataset(Dataset):
         self.harmony_manager = HarmonyAugmentationManager(
             dataset_groups_by_name=self.dataset_groups_by_name,
             pitch_shift_stems_by_group=self.pitch_shift_stems_by_group,
+        )
+        self.window_selector = StemWindowSelector(
+            dataset_groups_by_name=self.dataset_groups_by_name,
+            window_ms=self.window_ms,
+            p_intra_drop=self.p_intra_drop,
         )
 
         # primaryデータセット（最初のグループ）の曲名リスト
@@ -752,6 +760,8 @@ class StemDataset(Dataset):
                 f"Dataset '{group['name']}': {len(group['song_names'])} songs, "
                 f"weight={group['weight']}, prob={probability:.1f}%, "
                 f"cross_aug={group.get('use_for_cross_aug', True)}, "
+                f"active_window={group.get('active_window_sampling', False)}, "
+                f"multi_stem_same_song={group.get('allow_multi_stem_same_song', True)}, "
                 f"mask_inst={group.get('mask_instrument_loss', False)}, "
                 f"distort={group.get('distortion_augmentations', ()) or 'none'}, "
                 f"harmony={group.get('harmony_config', HarmonyAugmentationConfig()).describe()}"
@@ -834,6 +844,12 @@ class StemDataset(Dataset):
                     "weight": float(dataset_entry.get("weight", 1.0)),
                     "use_for_cross_aug": bool(
                         dataset_entry.get("use_for_cross_aug", True)
+                    ),
+                    "active_window_sampling": bool(
+                        dataset_entry.get("active_window_sampling", False)
+                    ),
+                    "allow_multi_stem_same_song": bool(
+                        dataset_entry.get("allow_multi_stem_same_song", True)
                     ),
                     "mask_instrument_loss": bool(
                         dataset_entry.get("mask_instrument_loss", False)
@@ -935,28 +951,27 @@ class StemDataset(Dataset):
 
         base_stems = self.stems_by_song[song_name]
 
-        # 1. Intra-drop augmentation: 曲を構成する各ステムを確率で落とす
-        selected_base_stems = []
-        for stem in base_stems:
-            if rng.random() >= self.p_intra_drop:
-                selected_base_stems.append(stem)
-
-        # もし全部ドロップしてしまったら、最低1つは残す
-        if not selected_base_stems:
-            selected_base_stems.append(rng.choice(base_stems))
+        # 1. 同一楽曲から使う base stem を選ぶ。
+        #    allow_multi_stem_same_song=false なら必ず1本だけ選ぶ。
+        selected_base_stems = self.window_selector.select_base_stems(
+            base_stems=base_stems,
+            selected_group=selected_group,
+            rng=rng,
+        )
 
         # 元曲で残っている楽器の集合を作成
         base_instruments = {
             _get_instrument_name(stem["stem_name"]) for stem in selected_base_stems
         }
 
-        # 2. ウィンドウ開始位置の決定: 選ばれたステムの最大のmin(duration_ms, end_note_ms)を基準にする
-        max_effective_end_ms = max(
-            min(int(stem["duration_ms"]), int(stem["end_note_ms"]))
-            for stem in selected_base_stems
+        # 2. base stem 群に共通の window 開始位置を決める。
+        #    active_window_sampling=true の場合は、ノートが重なりやすい
+        #    開始位置を優先的に選ぶ。
+        window_start_ms = self.window_selector.select_base_window_start_ms(
+            stems=selected_base_stems,
+            selected_group=selected_group,
+            rng=rng,
         )
-        max_start_ms = max(0, max_effective_end_ms - self.window_ms)
-        window_start_ms = rng.randint(0, max_start_ms) if max_start_ms > 0 else 0
 
         active_stems_with_offset = [
             (stem, window_start_ms) for stem in selected_base_stems
@@ -988,15 +1003,9 @@ class StemDataset(Dataset):
                         extra_inst = _get_instrument_name(extra_stem["stem_name"])
                         # 同じ楽器は追加しない
                         if extra_inst not in base_instruments:
-                            effective_end_ms = min(
-                                int(extra_stem["duration_ms"]),
-                                int(extra_stem["end_note_ms"]),
-                            )
-                            stem_max_start = max(0, effective_end_ms - self.window_ms)
-                            stem_window_start_ms = (
-                                rng.randint(0, stem_max_start)
-                                if stem_max_start > 0
-                                else 0
+                            stem_window_start_ms = self.window_selector.select_stem_window_start_ms(
+                                stem=extra_stem,
+                                rng=rng,
                             )
                             active_stems_with_offset.append(
                                 (extra_stem, stem_window_start_ms)
