@@ -71,7 +71,7 @@ def add_chord_training_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--chord_update_interval",
         type=int,
-        default=2,
+        default=1,
         help="Run chord auxiliary updates every N AMT steps.",
     )
 
