@@ -1,6 +1,10 @@
---extra-index-url https://download.pytorch.org/whl/cu128
-torch==2.7.0+cu128
-torchaudio==2.7.0+cu128
+# It is recommended to install PyTorch manually from https://pytorch.org/get-started/locally/ to ensure you get the correct version for your system and CUDA configuration.
+# The following lines are commented out to avoid potential installation issues. Please uncomment and modify them according to your needs.
+
+#--extra-index-url https://download.pytorch.org/whl/cu128
+#torch==2.7.0+cu128
+#torchaudio==2.7.0+cu128
+
 tensorboard
 torch_optimizer
 pyyaml
@@ -14,3 +18,11 @@ audiomentations
 pedalboard
 dlchordx
 miditoolkit
+
+# For separate inference, we need the following additional dependencies:
+stem-splitter
+git+https://github.com/xavriley/ADTOF-pytorch.git # For the ADTOF model, which is used for drum transcription.
+
+
+# The following line is commented out because yt-dlp may not be necessary for all users and can be installed separately if needed. Uncomment it if you want to include it in the requirements.
+# yt-dlp

@@ -1,9 +1,8 @@
 # @title Run stem-separated transcription
-OUTPUT_ROOT = "colab_outputs"  # @param {type:"string"}
+OUTPUT_ROOT = "K:"  # @param {type:"string"}
 WINDOW_BATCH_SIZE = 4  # @param {type:"integer"}
 MAX_MIDI_MELODIC_INSTRUMENTS = 15  # @param {type:"integer"}
-SKIP_DRUM_STEMS = True  # @param {type:"boolean"}
-CLEANUP_SEPARATED_STEMS = False  # @param {type:"boolean"}
+CLEANUP_SEPARATED_STEMS = True  # @param {type:"boolean"}
 MERGE_ONSET_MS = 20.0  # @param {type:"number"}
 
 from pathlib import Path
@@ -14,6 +13,14 @@ from tqdm import tqdm
 from separate_helper import run_stem_separated_transcription
 
 import argparse
+import os
+
+
+def safe_glob(pattern):
+    dir_part, file_pattern = os.path.split(pattern)
+    escaped_dir = glob.escape(dir_part)
+    full_pattern = os.path.join(escaped_dir, file_pattern)
+    return glob.glob(full_pattern)
 
 parser = argparse.ArgumentParser(description="Run stem-separated transcription")
 parser.add_argument(
@@ -28,7 +35,7 @@ args = parser.parse_args()
 # Collect audio files from the provided glob patterns
 audio_files = set()
 for pattern in args.audio_paths:
-    for file_path in glob.glob(pattern):
+    for file_path in safe_glob(pattern):
         audio_files.add(file_path)
 
 if not audio_files:
@@ -58,7 +65,6 @@ for audio_path in tqdm(audio_files, desc="Processing audio files"):
         output_root=OUTPUT_ROOT,
         window_batch_size=WINDOW_BATCH_SIZE,
         max_midi_melodic_instruments=MAX_MIDI_MELODIC_INSTRUMENTS,
-        skip_drum_stems=SKIP_DRUM_STEMS,
         cleanup_separated_stems=CLEANUP_SEPARATED_STEMS,
         merge_onset_ms=MERGE_ONSET_MS,
     )
@@ -70,5 +76,6 @@ for audio_path in tqdm(audio_files, desc="Processing audio files"):
         audio_dir = Path(audio_path).parent
         new_midi_path = audio_dir / merged_midi_path.name
         shutil.move(merged_midi_path, new_midi_path)
+
     except Exception as e:
         print(f"Error processing {audio_path}: {e}")    
