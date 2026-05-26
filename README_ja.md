@@ -217,19 +217,6 @@ python preprocess/resample_only.py \
   --target_sr 22050
 ```
 
-### 4. （任意）オフラインリバーブ
-
-学習用にリバーブ付きのステムを事前に生成できます:
-
-```bash
-python preprocess/apply_ir_augmentation.py \
-  --stems_dir ./stems \
-  --ir_dir ./IRs \
-  --output_dir ./stems_augments
-```
-
----
-
 ## 学習
 
 ### 基本
@@ -259,7 +246,6 @@ python train.py \
   --p_augment 1.0 \
   --p_intra_drop 0.3 \
   --p_cross_mix 0.5 \
-  --p_use_stems_augments 0.5 \
   --p_drum_mix 0.1 \
   --sa_p 0.5 --sa_freq_max 10 --sa_time_max 20 --sa_num_freq 2 --sa_num_time 2 \
   --wandb --project_name instrument_agnostic_amt
@@ -277,7 +263,6 @@ python train.py \
 | `--p_intra_drop` | `0.3` | 曲内のステムをランダムに落とす確率 |
 | `--p_cross_mix` | `0.5` | 別の曲からステムを混ぜる確率 |
 | `--p_augment` | `1.0` | オーディオ拡張を適用する確率 |
-| `--p_use_stems_augments` | `0.5` | リバーブ済みステムを使う確率 |
 | `--init-from` | `None` | 重み初期化用のチェックポイント |
 | `--no_amp` | `false` | 混合精度を無効化 |
 

@@ -207,10 +207,10 @@ def main():
         help="Probability of mixing cross-song stems",
     )
     parser.add_argument(
-        "--p_use_stems_augments",
-        type=float,
-        default=0.5,
-        help="Probability of loading reverb-processed stems from stems_augments folder",
+        "--max_cross_stems",
+        type=int,
+        default=5,
+        help="Maximum number of cross-song stems to mix into one sample",
     )
     parser.add_argument(
         "--sa_freq_max",
@@ -286,8 +286,8 @@ def main():
         sample_rate=args.sample_rate,
         p_intra_drop=args.p_intra_drop,
         p_cross_mix=args.p_cross_mix,
+        max_cross_stems=args.max_cross_stems,
         p_augment=args.p_augment,
-        p_use_stems_augments=args.p_use_stems_augments,
         ir_folder=args.ir_folder,
         noise_folder=args.noise_folder,
         drum_folder=args.drum_folder,

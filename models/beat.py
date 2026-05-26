@@ -64,7 +64,7 @@ def add_beat_training_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--beat_update_interval",
         type=int,
-        default=2,
+        default=1,
         help="Run beat auxiliary updates every N AMT steps.",
     )
     group.add_argument(

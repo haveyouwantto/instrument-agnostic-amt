@@ -456,7 +456,6 @@ def fuzz_augment(
     """
     波形を強く押し潰して、矩形波寄りの fuzz を作る。
     """
-    del sample_rate
     x = samples.astype(np.float32, copy=False)
     drive = max(1.0, float(drive))
     threshold = float(np.clip(threshold, 1e-3, 1.0))
