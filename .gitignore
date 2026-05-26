@@ -234,5 +234,5 @@ checkpoints_overlap/
 dataset_config.yaml
 *.yaml
 .codex
-
+*.bat
 beat_chord_dataset/

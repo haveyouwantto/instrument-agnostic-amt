@@ -74,6 +74,14 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+def clear_startup_cuda_cache() -> None:
+    """学習開始前に未使用の CUDA cache を解放する。"""
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.empty_cache()
+    logger.info("Cleared CUDA cache before training startup.")
+
+
 def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     """カスタムバッチ作成関数。テンソル以外のデータ(interval_targets)も適切にまとめる。"""
     audio = torch.stack([b["audio"] for b in batch])
@@ -131,6 +139,7 @@ def main():
         help="Path to dataset config YAML (dataset_config.yaml). Overrides manifest_path.",
     )
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--accumulation_steps", type=int, default=1, help="Number of steps to accumulate gradients")
     parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
     parser.add_argument(
         "--warmup_steps",
@@ -259,6 +268,9 @@ def main():
     add_chord_training_args(parser)
 
     args = parser.parse_args()
+
+    # 1. 学習開始前に未使用の CUDA cache を解放する
+    clear_startup_cuda_cache()
 
     set_seed(args.seed)
 
@@ -464,6 +476,8 @@ def main():
         logger.info(f"EMA enabled (decay={args.ema_decay})")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    if args.accumulation_steps <= 0:
+        raise ValueError("--accumulation_steps must be positive")
     if args.warmup_steps < 0:
         raise ValueError("--warmup_steps must be non-negative")
     if args.beat_update_interval <= 0:
@@ -479,6 +493,26 @@ def main():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     scaler = torch.amp.GradScaler(device.type) if use_grad_scaler else None
 
+    def flush_optimizer_step() -> None:
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scale_before_step = scaler.get_scale()
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer_step_was_skipped = scaler.get_scale() < scale_before_step
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer_step_was_skipped = False
+
+        if not optimizer_step_was_skipped:
+            scheduler.step()
+            if ema_model is not None:
+                ema_model.update(model)
+
+        optimizer.zero_grad(set_to_none=True)
+
     logger.info(
         "Starting training on %s (AMP: %s, AMP dtype: %s, GradScaler: %s, warmup_steps: %s)",
         device,
@@ -489,6 +523,7 @@ def main():
     )
 
     global_step = 0
+    optimizer.zero_grad(set_to_none=True)
     for epoch in range(1, args.epochs + 1):
         model.train()
         dataset.set_epoch(epoch)  # シードの更新
@@ -507,14 +542,21 @@ def main():
         beat_step_count = 0
         chord_epoch_loss = 0.0
         chord_step_count = 0
+        num_train_batches = len(dataloader)
+        micro_steps_in_window = 0
+        current_accumulation_steps = args.accumulation_steps
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}/{args.epochs}")
 
-        for batch in progress_bar:
+        for batch_idx, batch in enumerate(progress_bar, start=1):
+            if micro_steps_in_window == 0:
+                remaining_batches = num_train_batches - batch_idx + 1
+                current_accumulation_steps = min(
+                    args.accumulation_steps, remaining_batches
+                )
+
             step_index = global_step + 1
             audio = batch["audio"].to(device)
             valid_audio_frames = batch["valid_audio_frames"].to(device)
-
-            optimizer.zero_grad(set_to_none=True)
 
             # AMT / beat / chord を順に backward し、optimizer.step() は 1 回だけ行う。
             with torch.amp.autocast(
@@ -527,12 +569,13 @@ def main():
                     outputs, batch, args=args, model=model
                 )
 
+            loss_val = float(total_loss.item())
+            total_loss = total_loss / current_accumulation_steps
+
             if scaler is not None:
                 scaler.scale(total_loss).backward()
             else:
                 total_loss.backward()
-
-            loss_val = float(total_loss.item())
 
             beat_loss_val = None
             beat_loss_dict = None
@@ -557,12 +600,13 @@ def main():
                     loss_scale=args.beat_loss_scale,
                 )
 
+                beat_loss_val = float(beat_total_loss.item())
+                beat_total_loss = beat_total_loss / current_accumulation_steps
+
                 if scaler is not None:
                     scaler.scale(beat_total_loss).backward()
                 else:
                     beat_total_loss.backward()
-
-                beat_loss_val = float(beat_total_loss.item())
                 beat_epoch_loss += beat_loss_val
                 beat_step_count += 1
 
@@ -589,31 +633,20 @@ def main():
                     loss_scale=args.chord_loss_scale,
                 )
 
+                chord_loss_val = float(chord_total_loss.item())
+                chord_total_loss = chord_total_loss / current_accumulation_steps
+
                 if scaler is not None:
                     scaler.scale(chord_total_loss).backward()
                 else:
                     chord_total_loss.backward()
-
-                chord_loss_val = float(chord_total_loss.item())
                 chord_epoch_loss += chord_loss_val
                 chord_step_count += 1
 
-            if scaler is not None:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scale_before_step = scaler.get_scale()
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer_step_was_skipped = scaler.get_scale() < scale_before_step
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer_step_was_skipped = False
-
-            if not optimizer_step_was_skipped:
-                scheduler.step()
-                if ema_model is not None:
-                    ema_model.update(model)
+            micro_steps_in_window += 1
+            if micro_steps_in_window == current_accumulation_steps:
+                flush_optimizer_step()
+                micro_steps_in_window = 0
 
             epoch_loss += loss_val
             global_step += 1
@@ -647,7 +680,7 @@ def main():
                 postfix["chord_loss"] = f"{chord_loss_val:.4f}"
             progress_bar.set_postfix(postfix)
 
-        avg_epoch_loss = epoch_loss / len(dataloader)
+        avg_epoch_loss = epoch_loss / num_train_batches
         log_msg = f"Epoch {epoch} completed. Average Loss: {avg_epoch_loss:.4f}"
         if beat_step_count > 0:
             avg_beat_loss = beat_epoch_loss / beat_step_count
