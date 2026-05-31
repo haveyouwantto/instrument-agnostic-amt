@@ -25,6 +25,7 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 
 | Date | Update |
 |---|---|
+| 2026-05-31 | 🎤 Added vocal harmony model (`--type vocal_harmony`). Added `vocal_harmony` class to the instrument taxonomy to identify harmony.<br>🧩 Added Pitch Slot feature to predict overlapping note intervals simultaneously. |
 | 2026-05-20 | 🎸 Added guitar-focused model (`--type guitar`) |
 | 2026-05-18 | 📦 Added pitch-shift / time-stretch preprocessing scripts |
 | 2026-05-17 | 🎤 Added vocal-focused model (`--type vocal`) |
@@ -38,7 +39,7 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 ### Features
 
 - 🎹 **Works with any instrument** — Piano, guitar, bass, vocals, strings, wind instruments, and more
-- 🧠 **Neural Semi-CRF** — Viterbi decoding finds globally optimal note intervals for each pitch
+- 🧠 **Neural Semi-CRF + Pitch Slot** — Viterbi decoding finds globally optimal note intervals for each pitch, while Pitch Slots allow predicting overlapping notes of the same pitch.
 - 🎼 **HCQT features** — 5 harmonics × stereo 2ch Harmonic CQT captures rich pitch information
 - 🔧 **Extensive data augmentation** — Stem mixing, IR reverb, EQ, noise injection, drum addition, and more
 - 🧪 **[Experimental] Instrument classification & multi-track output** — 33+ instrument class head for per-instrument MIDI tracks (accuracy still improving)
@@ -103,6 +104,7 @@ Each layer alternates between a **band-axis Transformer** (attends across all to
 
 Each of the 88 pitch tracks is modeled as an independent semi-CRF:
 
+- **Pitch Slots** — Processes multiple slots in parallel to predict overlapping notes of the same pitch.
 - **Interval score** — bilinear attention between query and key projections
 - **Diagonal score** — additive bias for single-frame notes
 - **Viterbi decoding** — finds the globally optimal set of non-overlapping note intervals
@@ -329,7 +331,7 @@ python infer.py \
 | Argument | Default | Description |
 |---|---|---|
 | `--checkpoint` | (auto) | Path to the trained model. Automatically downloaded from HF if not provided |
-| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: fine-tuned for bass. `vocal`: fine-tuned for vocal. `guitar`: fine-tuned for guitar. |
+| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: fine-tuned for bass. `vocal`: fine-tuned for vocal. `guitar`: fine-tuned for guitar. `vocal_harmony`: fine-tuned for vocal harmony. |
 | `--audio` | (required) | Input audio path |
 | `--output-midi` | `<audio>.mid` | Output MIDI path |
 | `--amp` | `false` | Enable mixed precision inference |

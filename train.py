@@ -139,7 +139,12 @@ def main():
         help="Path to dataset config YAML (dataset_config.yaml). Overrides manifest_path.",
     )
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
-    parser.add_argument("--accumulation_steps", type=int, default=1, help="Number of steps to accumulate gradients")
+    parser.add_argument(
+        "--accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of steps to accumulate gradients",
+    )
     parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
     parser.add_argument(
         "--warmup_steps",
@@ -155,6 +160,39 @@ def main():
     )
     parser.add_argument(
         "--window_ms", type=int, default=8000, help="Audio window size in milliseconds"
+    )
+    parser.add_argument(
+        "--num_pitch_slots",
+        type=int,
+        default=1,
+        help="Number of deterministic pitch slots used to separate same-pitch overlaps.",
+    )
+    parser.add_argument(
+        "--semi_crf_false_negative_cost",
+        type=float,
+        default=0.0,
+        help=(
+            "Structured training cost for leaving gold-active frames uncovered. "
+            "Increase to push recall up."
+        ),
+    )
+    parser.add_argument(
+        "--semi_crf_false_positive_cost",
+        type=float,
+        default=0.0,
+        help=(
+            "Structured training cost for covering gold-silent frames with an interval. "
+            "Increase to push precision up."
+        ),
+    )
+    parser.add_argument(
+        "--instrument_loss_type",
+        choices=("bce", "ce"),
+        default="bce",
+        help=(
+            "Instrument loss type. Use 'bce' for multi-label BCE or 'ce' for "
+            "single-label softmax cross-entropy."
+        ),
     )
     parser.add_argument(
         "--no_amp", action="store_true", help="Disable mixed precision training"
@@ -296,6 +334,7 @@ def main():
         dataset_config_path=args.dataset_config,
         window_ms=args.window_ms,
         sample_rate=args.sample_rate,
+        num_pitch_slots=args.num_pitch_slots,
         p_intra_drop=args.p_intra_drop,
         p_cross_mix=args.p_cross_mix,
         max_cross_stems=args.max_cross_stems,
@@ -418,6 +457,7 @@ def main():
         sample_rate=dataset.sample_rate,
         hop_length=dataset.hop_length,
         n_fft=dataset.n_fft,
+        num_pitch_slots=args.num_pitch_slots,
         spec_augment_params=spec_augment_params if args.sa_p > 0.0 else None,
         use_beat_head=beat_dataset is not None,
         num_meter_classes=(
@@ -447,20 +487,43 @@ def main():
             # 'model_state_dict'キーがあればそれを、なければ辞書全体をロード
             state_dict = checkpoint.get("model_state_dict", checkpoint)
 
-            if config.use_beat_head or config.use_chord_head:
-                incompatible = model.load_state_dict(state_dict, strict=False)
-                if incompatible.missing_keys:
-                    logger.info(
-                        "Missing keys while loading checkpoint, initialized randomly: %s",
-                        incompatible.missing_keys,
-                    )
-                if incompatible.unexpected_keys:
-                    logger.warning(
-                        "Unexpected keys while loading checkpoint: %s",
-                        incompatible.unexpected_keys,
-                    )
-            else:
-                model.load_state_dict(state_dict)
+            model_state = model.state_dict()
+            for key in list(state_dict.keys()):
+                if key in model_state:
+                    if state_dict[key].shape != model_state[key].shape:
+                        logger.warning(
+                            "Shape mismatch for %s: checkpoint %s, model %s. Adapting...",
+                            key, state_dict[key].shape, model_state[key].shape
+                        )
+                        ckpt_shape = state_dict[key].shape
+                        mod_shape = model_state[key].shape
+                        
+                        if len(ckpt_shape) == 1:
+                            min_len = min(ckpt_shape[0], mod_shape[0])
+                            new_tensor = model_state[key].clone()
+                            new_tensor[:min_len] = state_dict[key][:min_len]
+                            state_dict[key] = new_tensor
+                        elif len(ckpt_shape) == 2:
+                            min_d0 = min(ckpt_shape[0], mod_shape[0])
+                            min_d1 = min(ckpt_shape[1], mod_shape[1])
+                            new_tensor = model_state[key].clone()
+                            new_tensor[:min_d0, :min_d1] = state_dict[key][:min_d0, :min_d1]
+                            state_dict[key] = new_tensor
+                        else:
+                            logger.warning("Unsupported shape mismatch dimension %s. Skipping key %s.", len(ckpt_shape), key)
+                            del state_dict[key]
+
+            incompatible = model.load_state_dict(state_dict, strict=False)
+            if incompatible.missing_keys:
+                logger.info(
+                    "Missing keys while loading checkpoint, initialized randomly: %s",
+                    incompatible.missing_keys,
+                )
+            if incompatible.unexpected_keys:
+                logger.warning(
+                    "Unexpected keys while loading checkpoint: %s",
+                    incompatible.unexpected_keys,
+                )
             logger.info("Weights initialized successfully.")
         else:
             logger.error(f"Checkpoint not found at {args.init_from}")
