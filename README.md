@@ -25,6 +25,7 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 
 | Date | Update |
 |---|---|
+| 2026-06-05 | 🎻 Added other-instrument-focused model (`--type other`) |
 | 2026-05-31 | 🎤 Added vocal harmony model (`--type vocal_harmony`). Added `vocal_harmony` class to the instrument taxonomy to identify harmony.<br>🧩 Added Pitch Slot feature to predict overlapping note intervals simultaneously. |
 | 2026-05-20 | 🎸 Added guitar-focused model (`--type guitar`) |
 | 2026-05-18 | 📦 Added pitch-shift / time-stretch preprocessing scripts |
@@ -331,7 +332,7 @@ python infer.py \
 | Argument | Default | Description |
 |---|---|---|
 | `--checkpoint` | (auto) | Path to the trained model. Automatically downloaded from HF if not provided |
-| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: fine-tuned for bass. `vocal`: fine-tuned for vocal. `guitar`: fine-tuned for guitar. `vocal_harmony`: fine-tuned for vocal harmony. |
+| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: fine-tuned for bass. `vocal`: fine-tuned for vocal. `guitar`: fine-tuned for guitar. `vocal_harmony`: fine-tuned for vocal harmony. `other`: fine-tuned for other instruments. |
 | `--audio` | (required) | Input audio path |
 | `--output-midi` | `<audio>.mid` | Output MIDI path |
 | `--amp` | `false` | Enable mixed precision inference |

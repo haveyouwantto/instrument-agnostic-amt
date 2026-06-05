@@ -22,8 +22,27 @@ import numpy as np
 from inference_postprocess import MidiMetadataEmbedder
 
 
-DEFAULT_CHECKPOINT_URL = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main/best_model.pth?download=true"
-DEFAULT_CHECKPOINT_PATH = Path("checkpoints/best_model.pth")
+HF_CHECKPOINT_BASE_URL = (
+    "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main"
+)
+MODEL_CHECKPOINT_FILENAMES = {
+    "default": "best_model.pth",
+    "bass": "best_model_bass.pth",
+    "vocal": "best_model_vocal.pth",
+    "guitar": "best_model_guitar.pth",
+    "vocal_harmony": "best_model_vocal_harmony.pth",
+    "other": "best_model_other.pth",
+}
+DEFAULT_CHECKPOINT_PATH = Path("checkpoints") / MODEL_CHECKPOINT_FILENAMES["default"]
+
+
+def _build_checkpoint_url(filename: str) -> str:
+    return f"{HF_CHECKPOINT_BASE_URL}/{filename}?download=true"
+
+
+DEFAULT_CHECKPOINT_URL = _build_checkpoint_url(
+    MODEL_CHECKPOINT_FILENAMES["default"]
+)
 
 
 @dataclass
@@ -126,9 +145,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--type",
-        choices=["default", "bass", "vocal", "guitar", "vocal_harmony"],
+        choices=list(MODEL_CHECKPOINT_FILENAMES.keys()),
         default="default",
-        help="Type of the model to download from Hugging Face if checkpoint is not provided. 'default' for multi-instrument, 'bass' for bass-focused model, 'vocal' for vocal-focused model, 'guitar' for guitar-focused model, 'vocal_harmony' for vocal harmony model.",
+        help="Type of the model to download from Hugging Face if checkpoint is not provided. 'default' for multi-instrument, 'bass' for bass-focused model, 'vocal' for vocal-focused model, 'guitar' for guitar-focused model, 'vocal_harmony' for vocal harmony model, 'other' for other-instrument-focused model.",
     )
 
     # 単一ファイルモード
@@ -340,33 +359,13 @@ def _parse_instrument_volume_args(entries: list[str]) -> dict[str, int]:
 def _ensure_checkpoint(
     checkpoint_path: Path | None, model_type: str = "default"
 ) -> Path:
+    checkpoint_filename = MODEL_CHECKPOINT_FILENAMES[model_type]
+    url = _build_checkpoint_url(checkpoint_filename)
     if checkpoint_path is None:
-        if model_type == "bass":
-            checkpoint_path = Path("checkpoints/best_model_bass.pth")
-            url = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main/best_model_bass.pth?download=true"
-        elif model_type == "vocal":
-            checkpoint_path = Path("checkpoints/best_model_vocal.pth")
-            url = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main/best_model_vocal.pth?download=true"
-        elif model_type == "guitar":
-            checkpoint_path = Path("checkpoints/best_model_guitar.pth")
-            url = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main/best_model_guitar.pth?download=true"
-        elif model_type == "vocal_harmony":
-            checkpoint_path = Path("checkpoints/best_model_vocal_harmony.pth")
-            url = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main/best_model_vocal_harmony.pth?download=true"
-        else:
+        if model_type == "default":
             checkpoint_path = DEFAULT_CHECKPOINT_PATH
-            url = DEFAULT_CHECKPOINT_URL
-    else:
-        if model_type == "bass":
-            url = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main/best_model_bass.pth?download=true"
-        elif model_type == "vocal":
-            url = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main/best_model_vocal.pth?download=true"
-        elif model_type == "guitar":
-            url = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main/best_model_guitar.pth?download=true"
-        elif model_type == "vocal_harmony":
-            url = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main/best_model_vocal_harmony.pth?download=true"
         else:
-            url = DEFAULT_CHECKPOINT_URL
+            checkpoint_path = Path("checkpoints") / checkpoint_filename
 
     if not checkpoint_path.exists():
         print(
