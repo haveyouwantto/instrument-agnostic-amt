@@ -4,7 +4,26 @@
 
 [日本語版 README はこちら](README_ja.md) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/instrument-agnostic-amt/blob/main/Colab_Inference.ipynb)
 
-[![Campus mode!! new model](https://img.youtube.com/vi/IXSfVcErRro/0.jpg)](https://www.youtube.com/watch?v=IXSfVcErRro)
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://youtu.be/aXi4b672a6M">
+        <img src="https://img.youtube.com/vi/aXi4b672a6M/0.jpg" alt="Transcription example" width="480">
+      </a>
+      <br>
+      <strong>Transcription example</strong>
+    </td>
+    <td align="center">
+      <a href="https://www.youtube.com/watch?v=JuVu-AoC5M0">
+        <img src="https://img.youtube.com/vi/JuVu-AoC5M0/0.jpg" alt="Original source video" width="480">
+      </a>
+      <br>
+      <strong>Original source video</strong>
+    </td>
+  </tr>
+</table>
+
+> **Video note**: The images above are clickable thumbnails. Click either one to watch the videos on YouTube.
 
 > **Colab tip**: [`Colab_Inference.ipynb`](Colab_Inference.ipynb) also includes an optional **stem-separated transcription** workflow: separate the song into stems, transcribe each stem, then merge the MIDI files. This often gives better results than transcribing the full mix directly, especially for dense arrangements with overlapping instruments.
 

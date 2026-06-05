@@ -4,7 +4,26 @@
 
 [English README](README.md) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/instrument-agnostic-amt/blob/main/Colab_Inference.ipynb)
 
-[![Campus mode!! new model](https://img.youtube.com/vi/IXSfVcErRro/0.jpg)](https://www.youtube.com/watch?v=IXSfVcErRro)
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://youtu.be/aXi4b672a6M">
+        <img src="https://img.youtube.com/vi/aXi4b672a6M/0.jpg" alt="採譜結果例" width="480">
+      </a>
+      <br>
+      <strong>採譜結果例</strong>
+    </td>
+    <td align="center">
+      <a href="https://www.youtube.com/watch?v=JuVu-AoC5M0">
+        <img src="https://img.youtube.com/vi/JuVu-AoC5M0/0.jpg" alt="元動画" width="480">
+      </a>
+      <br>
+      <strong>元動画</strong>
+    </td>
+  </tr>
+</table>
+
+> **動画について**: 上の画像はクリックできるサムネイルです。クリックすると YouTube で動画を見られます。
 
 > **Colab 補足**: [`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、**ステム分離してから採譜し、最後に MIDI をマージする** オプションのワークフローも入っています。曲全体をそのまま 1 回で採譜するより高精度になることが多く、特に音が重なりやすい密なアレンジで有効です。
 
