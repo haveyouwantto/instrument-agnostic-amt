@@ -211,10 +211,11 @@ def process_stem(
         return None
 
     # song_name は "__" より前の部分を使う。
-    # ピッチシフトやタイムストレッチのサフィックスがある場合は別曲扱いとして付加する。
+    # ピッチシフト / タイムストレッチ / swing のサフィックスがある場合は、
+    # 元データとは別曲扱いになるよう song_name にも付加する。
     import re
     stem_name = wav_path.stem
-    match = re.search(r"((?:_(?:pitch|stretch)_[^_]+)+)$", stem_name)
+    match = re.search(r"((?:_(?:pitch|stretch|swing)_[^_]+)+)$", stem_name)
     suffix = match.group(1) if match else ""
     base_name = stem_name[:match.start()] if match else stem_name
 

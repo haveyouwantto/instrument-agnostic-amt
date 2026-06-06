@@ -3,7 +3,8 @@
 
 このスクリプトは単体で実行できるようにしてあり、特定データセットのプリセットは持たない。
 音声はrubberbandで時間伸縮し、MIDIはtempo mapを同じ比率だけ変換する。
-既定では `.wav/.flac` と `.mid/.midi` を扱い、`_pitch_` / `_stretch_` 付きファイルは再入力しない。
+既定では `.wav/.flac` と `.mid/.midi` を扱い、`_pitch_` / `_stretch_` / `_swing_`
+付きファイルは再入力しない。
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ DEFAULT_TEMPO = 500_000
 MAX_TEMPO_VALUE = 16_777_215
 DEFAULT_AUDIO_EXTENSIONS = (".wav", ".flac")
 DEFAULT_MIDI_EXTENSIONS = (".mid", ".midi")
-DEFAULT_EXCLUDE_FILENAME_MARKERS = ("_pitch_", "_stretch_")
+DEFAULT_EXCLUDE_FILENAME_MARKERS = ("_pitch_", "_stretch_", "_swing_")
 SCRIPT_PATH_EXAMPLE = "preprocess/time_stretch_paired_dataset.py"
 INPUT_AUDIO_EXAMPLE = "path/to/audio_dir/song.wav"
 INPUT_MIDI_EXAMPLE = "path/to/midi_dir/song.mid"
