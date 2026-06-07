@@ -62,7 +62,7 @@ INSTRUMENT_CLASS_GAIN: dict[str, int] = {
     "sound_fx": 74,  
 
     # Solo Melody  
-    "melody": 110,  
+    "melody": 120,  
 }
 
 
