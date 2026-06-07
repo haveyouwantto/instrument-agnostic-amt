@@ -1,5 +1,5 @@
 # @title Run stem-separated transcription
-OUTPUT_ROOT = "K:"  # @param {type:"string"}
+OUTPUT_ROOT = "U:"  # @param {type:"string"}
 WINDOW_BATCH_SIZE = 4  # @param {type:"integer"}
 MAX_MIDI_MELODIC_INSTRUMENTS = 15  # @param {type:"integer"}
 CLEANUP_SEPARATED_STEMS = True  # @param {type:"boolean"}

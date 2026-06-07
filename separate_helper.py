@@ -10,6 +10,9 @@ import infer
 from stem_splitter.inference import SeparationConfig, _separate_one_file, load_mss_model
 
 from adtof_pytorch import transcribe_to_midi
+import librosa
+import soundfile as sf
+import numpy as np
 
 
 INSTRUMENT_CLASS_GAIN: dict[str, int] = {  
@@ -59,7 +62,7 @@ INSTRUMENT_CLASS_GAIN: dict[str, int] = {
     "sound_fx": 74,  
 
     # Solo Melody  
-    "melody": 120,  
+    "melody": 110,  
 }
 
 
@@ -182,6 +185,40 @@ def resolve_stem_paths(*, song_path, stem_dir, stem_names):
 
     return resolved
 
+def prepare_audio_for_stem_separation(audio_path, *, temp_dir):
+    """Stem Separation 向けに入力音声を一時的に 2ch WAV へそろえる。"""
+    audio_file = Path(audio_path)
+    waveform, sample_rate = librosa.load(str(audio_file), sr=None, mono=False)
+
+    if waveform.ndim == 1:
+        waveform = waveform[None, :]
+    elif waveform.ndim == 2 and waveform.shape[0] > waveform.shape[1]:
+        waveform = waveform.T
+
+    source_channels = int(waveform.shape[0])
+    if source_channels <= 0:
+        raise ValueError(f"Audio file has no channels: {audio_file}")
+    if source_channels == 2:
+        return audio_file
+
+    # 1. mono は疑似ステレオ化し、2. 3ch 以上は先頭 2ch を使う。
+    if source_channels == 1:
+        waveform = np.repeat(waveform, 2, axis=0)
+        channel_mode = "pseudo-stereo"
+    else:
+        waveform = waveform[:2]
+        channel_mode = "first-two-channels"
+
+    temp_dir = Path(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    prepared_path = temp_dir / f"{audio_file.stem}.wav"
+    sf.write(str(prepared_path), waveform.T, samplerate=int(sample_rate))
+    print(
+        f"Prepared {channel_mode} input for stem separation: "
+        f"source_channels={source_channels} -> {prepared_path.name}"
+    )
+    return prepared_path
+
 
 def get_stem_pipeline_models(checkpoint_path=None, device_preference=None, model_type="default"):
     """AMT とステム分離モデルを読み込み、セッション中は再利用する。"""
@@ -257,7 +294,7 @@ def run_stem_separated_transcription(
     bass_amt_config = bass_bundle["amt_config"]
     bass_amt_settings = bass_bundle["amt_settings"]
 
-    vocal_bundle = get_stem_pipeline_models(checkpoint_path=checkpoint_path, model_type="vocal")
+    vocal_bundle = get_stem_pipeline_models(checkpoint_path=checkpoint_path, model_type="vocal_harmony")
     vocal_amt_model = vocal_bundle["amt_model"]
     vocal_amt_config = vocal_bundle["amt_config"]
     vocal_amt_settings = vocal_bundle["amt_settings"]
@@ -267,6 +304,11 @@ def run_stem_separated_transcription(
     guitar_amt_config = guitar_bundle["amt_config"]
     guitar_amt_settings = guitar_bundle["amt_settings"]
 
+    other_bundle = get_stem_pipeline_models(checkpoint_path=checkpoint_path, model_type="other")
+    other_amt_model = other_bundle["amt_model"]
+    other_amt_config = other_bundle["amt_config"]
+    other_amt_settings = other_bundle["amt_settings"]
+
     # 1. 出力先を曲ごとに分ける。
     run_root = Path(output_root) / audio_file.stem
     stem_dir = run_root / "stems"
@@ -275,10 +317,15 @@ def run_stem_separated_transcription(
     for directory in (stem_dir, stem_midi_dir, merged_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
+    separation_input = prepare_audio_for_stem_separation(
+        audio_file,
+        temp_dir=run_root / "prepared_inputs",
+    )
+
     # 2. まず元音源をステム分離する。
     print(f"Separating stems for: {audio_file.name}")
     stems = _separate_one_file(
-        audio_file,
+        separation_input,
         stem_dir,
         sep_config,
         sep_model,
@@ -321,6 +368,10 @@ def run_stem_separated_transcription(
             current_amt_model = guitar_amt_model
             current_amt_config = guitar_amt_config
             current_amt_settings = guitar_amt_settings
+        elif "other" in stem_name.lower():
+            current_amt_model = other_amt_model
+            current_amt_config = other_amt_config
+            current_amt_settings = other_amt_settings
         else:
             current_amt_model = amt_model
             current_amt_config = amt_config
