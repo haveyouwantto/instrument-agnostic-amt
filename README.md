@@ -4,7 +4,26 @@
 
 [日本語版 README はこちら](README_ja.md) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/instrument-agnostic-amt/blob/main/Colab_Inference.ipynb)
 
-[![Campus mode!! new model](https://img.youtube.com/vi/IXSfVcErRro/0.jpg)](https://www.youtube.com/watch?v=IXSfVcErRro)
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://youtu.be/aXi4b672a6M">
+        <img src="https://img.youtube.com/vi/aXi4b672a6M/0.jpg" alt="Transcription example" width="480">
+      </a>
+      <br>
+      <strong>Transcription example</strong>
+    </td>
+    <td align="center">
+      <a href="https://www.youtube.com/watch?v=JuVu-AoC5M0">
+        <img src="https://img.youtube.com/vi/JuVu-AoC5M0/0.jpg" alt="Original source video" width="480">
+      </a>
+      <br>
+      <strong>Original source video</strong>
+    </td>
+  </tr>
+</table>
+
+> **Video note**: The images above are clickable thumbnails. Click either one to watch the videos on YouTube.
 
 > **Colab tip**: [`Colab_Inference.ipynb`](Colab_Inference.ipynb) also includes an optional **stem-separated transcription** workflow: separate the song into stems, transcribe each stem, then merge the MIDI files. This often gives better results than transcribing the full mix directly, especially for dense arrangements with overlapping instruments.
 
@@ -25,6 +44,8 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 
 | Date | Update |
 |---|---|
+| 2026-06-05 | 🎻 Added other-instrument-focused model (`--type other`) |
+| 2026-05-31 | 🎤 Added vocal harmony model (`--type vocal_harmony`). Added `vocal_harmony` class to the instrument taxonomy to identify harmony.<br>🧩 Added Pitch Slot feature to predict overlapping note intervals simultaneously. |
 | 2026-05-20 | 🎸 Added guitar-focused model (`--type guitar`) |
 | 2026-05-18 | 📦 Added pitch-shift / time-stretch preprocessing scripts |
 | 2026-05-17 | 🎤 Added vocal-focused model (`--type vocal`) |
@@ -38,7 +59,7 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 ### Features
 
 - 🎹 **Works with any instrument** — Piano, guitar, bass, vocals, strings, wind instruments, and more
-- 🧠 **Neural Semi-CRF** — Viterbi decoding finds globally optimal note intervals for each pitch
+- 🧠 **Neural Semi-CRF + Pitch Slot** — Viterbi decoding finds globally optimal note intervals for each pitch, while Pitch Slots allow predicting overlapping notes of the same pitch.
 - 🎼 **HCQT features** — 5 harmonics × stereo 2ch Harmonic CQT captures rich pitch information
 - 🔧 **Extensive data augmentation** — Stem mixing, IR reverb, EQ, noise injection, drum addition, and more
 - 🧪 **[Experimental] Instrument classification & multi-track output** — 33+ instrument class head for per-instrument MIDI tracks (accuracy still improving)
@@ -103,6 +124,7 @@ Each layer alternates between a **band-axis Transformer** (attends across all to
 
 Each of the 88 pitch tracks is modeled as an independent semi-CRF:
 
+- **Pitch Slots** — Processes multiple slots in parallel to predict overlapping notes of the same pitch.
 - **Interval score** — bilinear attention between query and key projections
 - **Diagonal score** — additive bias for single-frame notes
 - **Viterbi decoding** — finds the globally optimal set of non-overlapping note intervals
@@ -329,7 +351,7 @@ python infer.py \
 | Argument | Default | Description |
 |---|---|---|
 | `--checkpoint` | (auto) | Path to the trained model. Automatically downloaded from HF if not provided |
-| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: fine-tuned for bass. `vocal`: fine-tuned for vocal. `guitar`: fine-tuned for guitar. |
+| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: fine-tuned for bass. `vocal`: fine-tuned for vocal. `guitar`: fine-tuned for guitar. `vocal_harmony`: fine-tuned for vocal harmony. `other`: fine-tuned for other instruments. |
 | `--audio` | (required) | Input audio path |
 | `--output-midi` | `<audio>.mid` | Output MIDI path |
 | `--amp` | `false` | Enable mixed precision inference |

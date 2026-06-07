@@ -4,7 +4,26 @@
 
 [English README](README.md) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/instrument-agnostic-amt/blob/main/Colab_Inference.ipynb)
 
-[![Campus mode!! new model](https://img.youtube.com/vi/IXSfVcErRro/0.jpg)](https://www.youtube.com/watch?v=IXSfVcErRro)
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://youtu.be/aXi4b672a6M">
+        <img src="https://img.youtube.com/vi/aXi4b672a6M/0.jpg" alt="採譜結果例" width="480">
+      </a>
+      <br>
+      <strong>採譜結果例</strong>
+    </td>
+    <td align="center">
+      <a href="https://www.youtube.com/watch?v=JuVu-AoC5M0">
+        <img src="https://img.youtube.com/vi/JuVu-AoC5M0/0.jpg" alt="元動画" width="480">
+      </a>
+      <br>
+      <strong>元動画</strong>
+    </td>
+  </tr>
+</table>
+
+> **動画について**: 上の画像はクリックできるサムネイルです。クリックすると YouTube で動画を見られます。
 
 > **Colab 補足**: [`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、**ステム分離してから採譜し、最後に MIDI をマージする** オプションのワークフローも入っています。曲全体をそのまま 1 回で採譜するより高精度になることが多く、特に音が重なりやすい密なアレンジで有効です。
 
@@ -26,6 +45,8 @@
 
 | 日付 | 内容 |
 |---|---|
+| 2026-06-05 | 🎻 その他楽器専用モデルを追加（`--type other`） |
+| 2026-05-31 | 🎤 ボーカルハモリモデルを追加（`--type vocal_harmony`）。ハモリを識別できるように楽器一覧に `vocal_harmony` クラスを追加。<br>🧩 重複するノート区間を同時に予測できる Pitch Slot 機能を追加。 |
 | 2026-05-20 | 🎸 ギター専用モデルを追加（`--type guitar`） |
 | 2026-05-18 | 📦 ピッチシフト・タイムストレッチ用の前処理スクリプトを追加 |
 | 2026-05-17 | 🎤 ボーカル専用モデルを追加（`--type vocal`） |
@@ -39,7 +60,7 @@
 ### 特徴
 
 - 🎹 **楽器を問わない採譜** — ピアノ、ギター、ベース、ボーカル、ストリングス、管楽器など
-- 🧠 **Neural Semi-CRF** — ピッチごとに最適なノート区間を Viterbi で一括デコード
+- 🧠 **Neural Semi-CRF + Pitch Slot** — ピッチごとに最適なノート区間を Viterbi で一括デコード。Pitch Slot により同じ音程の重複ノートも同時に予測可能
 - 🎼 **HCQT 特徴量** — 5つの倍音 × ステレオ 2ch の Harmonic CQT で音高情報をしっかり捉える
 - 🔧 **豊富なデータ拡張** — ステムの混ぜ合わせ、IR リバーブ、EQ、ノイズ、ドラム追加など
 - 🧪 **[実験的] 楽器識別 & マルチトラック出力** — 33+ 楽器クラスの分類ヘッド付き（精度は改善中）
@@ -104,6 +125,7 @@
 
 88 本のピッチトラックをそれぞれ独立した Semi-CRF としてモデル化します:
 
+- **Pitch Slot** — 同じピッチで音が重なる区間（ユニゾン等）を予測できるよう、複数のスロットを並列処理
 - **インターバルスコア** — Query と Key のバイリニアアテンションで算出
 - **対角スコア** — 1フレームだけのノート用の加算バイアス
 - **Viterbi デコード** — 重複しないノート区間の最適解をグローバルに探索
@@ -330,7 +352,7 @@ python infer.py \
 | 引数 | デフォルト | 説明 |
 |---|---|---|
 | `--checkpoint` | (自動) | 学習済みモデルのパス。指定しない場合は HF から自動取得 |
-| `--type` | `default` | ダウンロードするモデルの種類。`default`: 全楽器用、`bass`: ベース専用モデル、`vocal`: ボーカル専用モデル、`guitar`: ギター専用モデル |
+| `--type` | `default` | ダウンロードするモデルの種類。`default`: 全楽器用、`bass`: ベース専用モデル、`vocal`: ボーカル専用モデル、`guitar`: ギター専用モデル、`vocal_harmony`: ボーカルハモリモデル、`other`: その他楽器専用モデル |
 | `--audio` | （必須） | 入力オーディオのパス |
 | `--output-midi` | `<audio>.mid` | 出力 MIDI のパス |
 | `--amp` | `false` | 混合精度推論を有効化 |
