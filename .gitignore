@@ -236,3 +236,8 @@ dataset_config.yaml
 .codex
 *.bat
 beat_chord_dataset/
+
+# Output MIDI files
+out/
+outputs/
+uploads/
