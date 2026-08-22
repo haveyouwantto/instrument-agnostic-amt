@@ -179,7 +179,8 @@ instrument_agnostic_amt/
 ├── instrument_merge.json       # 楽器分類の定義
 ├── gm_instrument_classes.json  # General MIDI メタデータ
 ├── dataset_config.yaml         # データセットの重み付け設定
-├── requirements.txt            # 依存パッケージ
+├── pyproject.toml              # プロジェクト定義と依存パッケージ（uv）
+├── uv.lock                     # 依存バージョンのロックファイル
 │
 ├── models/
 │   ├── model.py                # AudioSemiCRFTransformer（モデル本体）
@@ -202,24 +203,35 @@ instrument_agnostic_amt/
 
 ### 必要なもの
 
-- Python 3.10+
-- CUDA 対応 GPU（VRAM 12GB 以上推奨）
+- Python 3.10 〜 3.14
+- [uv](https://docs.astral.sh/uv/)（依存パッケージ管理）
+- PyTorch 2.13.0 / torchaudio 2.11.0 — `uv.lock` から自動でインストールされます
+- NVIDIA GPU（VRAM 12GB 以上推奨）、Apple Silicon Mac、または CPU
+
+> Linux / Windows では CUDA 13.0 wheel、Apple Silicon macOS では
+> プラットフォーム向けのPyTorch wheelを解決します。PyTorch 2.13 はIntel Mac
+> 向けwheelを提供していません。
 
 ```bash
 # クローン
 git clone https://github.com/anime-song/instrument-agnostic-amt.git
 cd instrument-agnostic-amt
 
-# 仮想環境
-python -m venv .venv
-source .venv/bin/activate  # Linux/macOS
-# .venv\Scripts\activate   # Windows
+# uv.lock のバージョンに固定した推論用コア依存パッケージ
+uv sync --locked
 
-# 依存パッケージ
-pip install -r requirements.txt
+# 用途別のオプション依存
+uv sync --locked --extra stem        # ステム分離推論
+uv sync --locked --extra evaluation  # 評価スクリプト
+uv sync --locked --extra training    # 学習用依存パッケージ
 ```
 
-> `audiomentations` は学習時のオーグメンテーションで使います。推論だけなら入れなくても動きます。
+`uv sync` は `.venv/` を作成します。`source .venv/bin/activate` で有効化するか、
+`uv run python infer.py --audio input.wav` のように各コマンドへ `uv run` を付けてください。
+
+リポジトリの `.python-version` は、対応範囲を狭めずに開発環境の既定を
+Python 3.12 へ揃えます。Python 3.12 が未導入の場合、Python の自動取得を
+無効化しているかオフラインでない限り、uv が管理する CPython を自動取得します。
 
 ---
 
@@ -413,6 +425,24 @@ python infer.py --audio input_song.wav
 
 > **Note**: `--checkpoint` を指定しない場合、自動的に Hugging Face から最新のモデルがダウンロードされます。
 
+### デバイス選択
+
+`--device` のデフォルトは `auto` で、**CUDA → MPS → CPU** の順に利用可能な
+バックエンドを選びます。デバイスを明示することもでき、利用できないアクセラレータを
+指定した場合は、暗黙にフォールバックせずエラーで停止します。
+
+```bash
+python infer.py --audio input_song.wav                # auto: CUDA → MPS → CPU
+python infer.py --audio input_song.wav --device mps   # Apple Silicon GPU
+python infer.py --audio input_song.wav --device cpu
+```
+
+MPS を使うには、PyTorch の MPS バックエンドを利用できる Apple Silicon Mac が必要です。
+PyTorch が MPS 未対応の演算を報告した場合は、`--device cpu` で再実行してください。
+CPU・CUDA・MPS 間では、浮動小数点演算による小さな結果差が生じることがあります。
+混合精度は `--amp` を指定した場合だけ有効になり、MPS のデフォルトdtypeはfp16です。
+`--amp-dtype` で変更できます。
+
 ### Google Colab のステム分離ワークフロー
 
 Google Colab 用ノートブック [`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、以下のオプション機能があります。
@@ -472,6 +502,7 @@ python infer.py \
   --checkpoint checkpoints/checkpoint_epoch_100.pth \
   --audio input_song.wav \
   --output-midi output.mid \
+  --device auto \
   --amp \
   --window-ms 8000 \
   --stride-ms 4000 \
@@ -488,7 +519,9 @@ python infer.py \
 | `--type` | `default` | ダウンロードするモデルの種類。`default`: 全楽器用、`bass`: 従来のベース専用モデル、`bass_v2`: 新しいベース専用モデル、`vocal`: ボーカル専用モデル、`guitar`: 従来のギター専用モデル、`guitar_v1_5`: 新しいギター専用モデル、`vocal_harmony`: ボーカルハモリモデル、`drums`: **実験的 (Experimental)** なドラム専用モデル、`other`: その他楽器専用モデル |
 | `--audio` | （必須） | 入力オーディオのパス |
 | `--output-midi` | `<audio>.mid` | 出力 MIDI のパス |
-| `--amp` | `false` | 混合精度推論を有効化 |
+| `--device` | `auto` | 推論デバイス。`auto` は CUDA → MPS → CPU の順に選択。`cuda`、`mps`、`cpu` の明示指定も可能 |
+| `--amp` | `false` | CUDA または MPS で混合精度推論を有効化 |
+| `--amp-dtype` | デバイス既定 | `fp16` または `bf16`。対応CUDAではbf16、MPSではfp16が既定 |
 | `--window-ms` | 学習時の値 | 推論ウィンドウサイズ (ms) |
 | `--stride-ms` | `window-ms / 2` | ウィンドウのストライド |
 | `--window-batch-size` | `1` | まとめて処理するウィンドウ数 |

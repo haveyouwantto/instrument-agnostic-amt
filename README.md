@@ -178,7 +178,8 @@ instrument_agnostic_amt/
 ├── instrument_merge.json       # Instrument taxonomy definition
 ├── gm_instrument_classes.json  # General MIDI metadata
 ├── dataset_config.yaml         # Multi-dataset weighted sampling config
-├── requirements.txt            # Dependencies
+├── pyproject.toml              # Project metadata and dependencies (uv)
+├── uv.lock                     # Locked dependency versions
 │
 ├── models/
 │   ├── model.py                # AudioSemiCRFTransformer (top-level model)
@@ -201,24 +202,36 @@ instrument_agnostic_amt/
 
 ### Requirements
 
-- Python 3.10+
-- CUDA GPU (12GB+ VRAM recommended)
+- Python 3.10 – 3.14
+- [uv](https://docs.astral.sh/uv/) for dependency management
+- PyTorch 2.13.0 / torchaudio 2.11.0 — installed automatically from `uv.lock`
+- NVIDIA GPU (12GB+ VRAM recommended), Apple Silicon Mac, or CPU
+
+> Linux and Windows resolve to the CUDA 13.0 wheels. Apple Silicon macOS
+> resolves to the platform PyTorch wheels; PyTorch 2.13 does not provide Intel
+> macOS wheels.
 
 ```bash
 # Clone
 git clone https://github.com/anime-song/instrument-agnostic-amt.git
 cd instrument-agnostic-amt
 
-# Virtual environment
-python -m venv .venv
-source .venv/bin/activate  # Linux/macOS
-# .venv\Scripts\activate   # Windows
+# Core inference dependencies, using the exact versions in uv.lock
+uv sync --locked
 
-# Dependencies
-pip install -r requirements.txt
+# Optional workflows
+uv sync --locked --extra stem        # stem-separated inference
+uv sync --locked --extra evaluation  # evaluation scripts
+uv sync --locked --extra training    # training dependencies
 ```
 
-> `audiomentations` is needed for training augmentation. You can skip it if you only need inference.
+`uv sync` creates `.venv/`. Activate it with `source .venv/bin/activate`, or
+prefix commands with `uv run`, for example `uv run python infer.py --audio input.wav`.
+
+The repository's `.python-version` selects Python 3.12 as the default development
+interpreter without narrowing the supported Python 3.10–3.14 range. If Python
+3.12 is unavailable, uv downloads a managed CPython automatically unless Python
+downloads are disabled or the machine is offline.
 
 ---
 
@@ -455,6 +468,24 @@ python infer.py --audio input_song.wav
 
 > **Note**: If `--checkpoint` is not provided, the model will be automatically downloaded from Hugging Face.
 
+### Device selection
+
+`--device` defaults to `auto` and selects the first available backend in the
+order **CUDA → MPS → CPU**. You can also pin a backend explicitly; requesting
+an unavailable accelerator raises an error instead of silently falling back.
+
+```bash
+python infer.py --audio input_song.wav                # auto: CUDA → MPS → CPU
+python infer.py --audio input_song.wav --device mps   # Apple Silicon GPU
+python infer.py --audio input_song.wav --device cpu
+```
+
+MPS requires an Apple Silicon Mac with a PyTorch MPS backend. If PyTorch reports
+that an operation is unsupported on MPS, retry with `--device cpu`. Small
+floating-point differences between CPU, CUDA, and MPS results are expected.
+Mixed precision remains opt-in with `--amp`; on MPS its default dtype is fp16
+and can be changed with `--amp-dtype`.
+
 ### Stem-separated workflow in Google Colab
 
 The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) includes an optional workflow that:
@@ -514,6 +545,7 @@ python infer.py \
   --checkpoint checkpoints/checkpoint_epoch_100.pth \
   --audio input_song.wav \
   --output-midi output.mid \
+  --device auto \
   --amp \
   --window-ms 8000 \
   --stride-ms 4000 \
@@ -530,7 +562,9 @@ python infer.py \
 | `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: original bass model. `bass_v2`: updated bass model. `vocal`: fine-tuned for vocal. `guitar`: original guitar model. `guitar_v1_5`: updated guitar model. `vocal_harmony`: fine-tuned for vocal harmony. `drums`: **Experimental** drum-focused model. `other`: fine-tuned for other instruments. |
 | `--audio` | (required) | Input audio path |
 | `--output-midi` | `<audio>.mid` | Output MIDI path |
-| `--amp` | `false` | Enable mixed precision inference |
+| `--device` | `auto` | Inference device. `auto` selects CUDA → MPS → CPU; `cuda`, `mps`, or `cpu` can be set explicitly |
+| `--amp` | `false` | Enable mixed precision inference on CUDA or MPS |
+| `--amp-dtype` | device default | `fp16` or `bf16`; defaults to bf16 on supported CUDA devices and fp16 on MPS |
 | `--window-ms` | training value | Inference window size (ms) |
 | `--stride-ms` | `window-ms / 2` | Window stride |
 | `--window-batch-size` | `1` | Windows to process at once |
