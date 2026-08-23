@@ -90,20 +90,25 @@ def test_expression_cc_follows_loudness(tmp_path) -> None:
     assert all(a < b for a, b in zip(times, times[1:]))
     median_interval = float(np.median(np.diff(times)))
     assert median_interval <= 0.05  # millisecond-level resolution
-    values = [event.value for event in violin_events]
-    assert max(
-        abs(b - a) for a, b in zip(values, values[1:])
-    ) <= 8  # step-limited, no instant jumps
 
-    violin_first = [event.value for event in violin_events if event.time < 2.0]
-    violin_second = [event.value for event in violin_events if event.time >= 2.0]
-    flute_first = [event.value for event in flute_events if event.time < 2.0]
-    flute_second = [event.value for event in flute_events if event.time >= 2.0]
-    assert violin_first and violin_second
-    assert flute_first and flute_second
     # Each instrument follows its own loudness, not the stem's.
-    assert float(np.mean(violin_first)) > float(np.mean(violin_second))
-    assert float(np.mean(flute_second)) > float(np.mean(flute_first))
+    assert _value_at_or_before(violin_events, 1.0) == 127  # violin loud in first half
+    assert _value_at_or_before(violin_events, 3.0) < 100  # violin quiet in second half
+    assert _value_at_or_before(flute_events, 1.0) < 100  # flute quiet in first half
+    assert _value_at_or_before(flute_events, 3.0) == 127  # flute loud in second half
+
+
+def _value_at_or_before(
+    events: list[pretty_midi.ControlChange],
+    target_time: float,
+) -> int | None:
+    """CC state at ``target_time`` (the last event at or before it)."""
+    value = None
+    for event in events:
+        if event.time > target_time:
+            break
+        value = int(event.value)
+    return value
 
 
 def test_frame_events_are_millisecond_resolution() -> None:
@@ -127,16 +132,15 @@ def test_frame_events_are_millisecond_resolution() -> None:
     assert all(a < b for a, b in zip(times, times[1:]))
 
 
-def test_frame_events_are_step_limited() -> None:
+def test_frame_events_fade_in_out_keep_transients() -> None:
     midi = pretty_midi.PrettyMIDI(resolution=480)
-    notes = [pretty_midi.Note(velocity=90, pitch=67, start=0.0, end=4.0)]
-    curve_times = np.arange(0.0, 4.0, 0.02)
-    # quiet dB first (CC ~22 after normalization), then loud (normalized peak).
-    curve_values = np.concatenate(
-        [
-            np.full(100, 6.0),
-            np.full(int(curve_times.shape[0]) - 100, 40.0),
-        ]
+    notes = [pretty_midi.Note(velocity=90, pitch=67, start=0.5, end=1.5)]
+    curve_times = np.arange(0.4, 1.6, 0.02)
+    # Alternating quiet/loud frames inside the phrase to expose transients.
+    curve_values = np.where(
+        np.arange(int(curve_times.shape[0])) % 2 == 0,
+        10.0,
+        40.0,
     )
     events = build_frame_cc_events(
         midi,
@@ -146,14 +150,23 @@ def test_frame_events_are_step_limited() -> None:
         interval_seconds=0.02,
         cc_min=8,
         cc_max=127,
-        max_step=8,
+        fade_seconds=0.15,
     )
     assert events
+    fade_in = [event for event in events if event[0] < 0.5]
+    fade_out = [event for event in events if event[0] > 1.5]
+    assert fade_in
+    assert fade_out
+    assert abs(fade_in[0][0] - 0.35) < 0.02  # starts one fade length before
+    assert fade_in[0][1] == 8  # ramp starts from the rest value
+    fade_in_values = [value for _time, value in fade_in]
+    assert fade_in_values == sorted(fade_in_values)  # linear increase before start
+    assert fade_out[-1][1] == 8  # ramp ends at the rest value
+    fade_out_values = [value for _time, value in fade_out]
+    assert fade_out_values == sorted(fade_out_values, reverse=True)  # linear decrease
+    # Intra-phrase transients are NOT flattened by a step limit.
     values = [event[1] for event in events]
-    # The very first event ramps down from the MIDI CC default (127).
-    assert values[0] == 119
-    assert max(abs(b - a) for a, b in zip(values, values[1:])) <= 8
-    assert values[-1] == 127  # the loud section reaches the normalized peak
+    assert max(abs(b - a) for a, b in zip(values, values[1:])) > 8
 
 
 def test_apply_expression_replaces_existing_cc(tmp_path) -> None:

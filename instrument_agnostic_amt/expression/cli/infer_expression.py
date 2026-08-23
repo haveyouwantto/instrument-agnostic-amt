@@ -346,7 +346,7 @@ def build_frame_cc_events(
     cc_min: int,
     cc_max: int,
     dynamic_stretch: float = 1.0,
-    max_step: int = 8,
+    fade_seconds: float = 0.15,
     min_db: float = 0.0,
     max_db: float = 48.0,
     curve_exponent: float = 1.2,
@@ -356,9 +356,10 @@ def build_frame_cc_events(
     Every curve frame inside the track's note span (first note start .. last
     note end) is mapped to a CC value via the 0..48 dB -> 8..127 power-law
     curve, then normalized/stretched per track.  Events are written on a
-    ``interval_seconds`` grid (default 20 ms), deduplicated by tick (later
-    frame wins) and consecutive equal values are collapsed, so the track gets
-    a continuously-moving expression curve without same-tick conflicts.
+    ``interval_seconds`` grid (default 20 ms).  Around each phrase (contiguous
+    note-activity span), a linear fade-in ramps up before the start and a
+    linear fade-out ramps down after the end, so phrase edges are smooth while
+    the intra-phrase transients stay untouched.
     """
     if not notes:
         return []
@@ -389,42 +390,92 @@ def build_frame_cc_events(
     )
 
     # Re-sample onto the requested millisecond grid, dedupe by tick (later
-    # frame wins), then collapse consecutive equal values.
+    # frame wins).
     frame_dt = (
         float(curve_times[1] - curve_times[0])
         if curve_times.shape[0] > 1
         else 0.0
     )
-    step = (
+    grid_step = (
         max(1, int(round(float(interval_seconds) / frame_dt)))
         if frame_dt > 0
         else 1
     )
     by_tick: dict[int, int] = {}
-    for frame_index in range(0, int(frame_times.shape[0]), step):
+    for frame_index in range(0, int(frame_times.shape[0]), grid_step):
         tick = int(midi.time_to_tick(float(frame_times[frame_index])))
         by_tick[tick] = int(frame_cc[frame_index])
 
-    raw_events: list[tuple[float, int]] = []
-    previous: int = int(cc_max)  # MIDI CC default is full value (127)
-    for tick in sorted(by_tick):
-        target = by_tick[tick]
-        value = int(
-            np.clip(
-                float(target),
-                previous - int(max_step),
-                previous + int(max_step),
-            )
-        )
-        raw_events.append((float(midi.tick_to_time(tick)), value))
-        previous = value
-    # Collapse consecutive equal values after the step-limited smoothing.
+    # Linear fade-in before each phrase start and fade-out after each phrase
+    # end, from/to the rest value (cc_min).
+    if fade_seconds > 0.0 and notes:
+        spans = _note_spans(notes)
+        for span_start, span_end in spans:
+            first_value = _curve_value_at(frame_cc, frame_times, span_start)
+            last_value = _curve_value_at(frame_cc, frame_times, span_end)
+
+            fade_start = max(0.0, span_start - fade_seconds)
+            fade_time = fade_start
+            while fade_time < span_start:
+                fraction = (fade_time - fade_start) / (span_start - fade_start) if span_start > fade_start else 1.0
+                value = int(round(float(cc_min) + (first_value - cc_min) * fraction))
+                tick = int(midi.time_to_tick(fade_time))
+                by_tick[tick] = max(by_tick.get(tick, cc_min), value)
+                fade_time += interval_seconds
+
+            fade_time = span_end + interval_seconds
+            fade_end = span_end + fade_seconds
+            while fade_time <= fade_end:
+                fraction = (fade_time - span_end) / fade_seconds if fade_seconds > 0 else 1.0
+                value = int(round(float(last_value) + (cc_min - last_value) * fraction))
+                tick = int(midi.time_to_tick(fade_time))
+                by_tick[tick] = min(by_tick.get(tick, cc_max), value)
+                fade_time += interval_seconds
+            # Ensure the fade-out ends exactly at the rest value.
+            tick = int(midi.time_to_tick(fade_end))
+            by_tick[tick] = min(by_tick.get(tick, cc_max), cc_min)
+
+    # Emit sorted ticks, collapsing consecutive equal values.
     events: list[tuple[float, int]] = []
-    for time_value, value in raw_events:
-        if events and events[-1][1] == value:
+    last_value: int | None = None
+    for tick in sorted(by_tick):
+        value = by_tick[tick]
+        if value == last_value:
             continue
-        events.append((time_value, value))
+        events.append((float(midi.tick_to_time(tick)), value))
+        last_value = value
     return events
+
+
+def _note_spans(
+    notes: Sequence[pretty_midi.Note],
+    *,
+    merge_gap_seconds: float = 0.05,
+) -> list[tuple[float, float]]:
+    """Merge note intervals into contiguous sounding spans."""
+    if not notes:
+        return []
+    events = sorted((float(note.start), float(note.end)) for note in notes)
+    spans: list[list[float]] = []
+    for start, end in events:
+        if spans and start <= spans[-1][1] + merge_gap_seconds:
+            spans[-1][1] = max(spans[-1][1], end)
+        else:
+            spans.append([start, end])
+    return [(span[0], span[1]) for span in spans]
+
+
+def _curve_value_at(
+    values: Sequence[int],
+    times: np.ndarray,
+    time_seconds: float,
+) -> int:
+    """Nearest curve CC value to a given time (for fade endpoints)."""
+    if times.shape[0] == 0:
+        return int(values[0]) if values else 0
+    index = int(np.searchsorted(times, time_seconds, side="right")) - 1
+    index = max(0, min(index, len(values) - 1))
+    return int(values[index])
 
 
 def _is_sustained(
@@ -448,7 +499,7 @@ def apply_expression_to_midi(
     cc_min: int = 8,
     cc_max: int = 127,
     dynamic_stretch: float = 1.0,
-    max_step: int = 8,
+    fade_seconds: float = 0.15,
     smoothing_seconds: float = 0.1,
     min_db: float = 0.0,
     max_db: float = 48.0,
@@ -472,7 +523,7 @@ def apply_expression_to_midi(
             cc_min=cc_min,
             cc_max=cc_max,
             dynamic_stretch=dynamic_stretch,
-            max_step=max_step,
+            fade_seconds=fade_seconds,
             min_db=min_db,
             max_db=max_db,
             curve_exponent=curve_exponent,
@@ -493,7 +544,7 @@ def _apply_expression_to_instrument(
     cc_min: int,
     cc_max: int,
     dynamic_stretch: float,
-    max_step: int,
+    fade_seconds: float,
     min_db: float,
     max_db: float,
     curve_exponent: float,
@@ -519,7 +570,7 @@ def _apply_expression_to_instrument(
         cc_min=cc_min,
         cc_max=cc_max,
         dynamic_stretch=dynamic_stretch,
-        max_step=max_step,
+        fade_seconds=fade_seconds,
         min_db=min_db,
         max_db=max_db,
         curve_exponent=curve_exponent,
@@ -552,7 +603,7 @@ def apply_expression_to_merged_midi(
     cc_min: int = 8,
     cc_max: int = 127,
     dynamic_stretch: float = 1.0,
-    max_step: int = 8,
+    fade_seconds: float = 0.15,
     smoothing_seconds: float = 0.1,
     min_db: float = 0.0,
     max_db: float = 48.0,
@@ -643,7 +694,7 @@ def apply_expression_to_merged_midi(
             cc_min=cc_min,
             cc_max=cc_max,
             dynamic_stretch=dynamic_stretch,
-            max_step=max_step,
+            fade_seconds=fade_seconds,
             min_db=min_db,
             max_db=max_db,
             curve_exponent=curve_exponent,
@@ -672,7 +723,7 @@ def predict_expression_for_stem_midis(
     cc_min: int = 8,
     cc_max: int = 127,
     dynamic_stretch: float = 1.0,
-    max_step: int = 8,
+    fade_seconds: float = 0.15,
     smoothing_seconds: float = 0.1,
     min_db: float = 0.0,
     max_db: float = 48.0,
@@ -750,7 +801,7 @@ def predict_expression_for_stem_midis(
                 cc_min=cc_min,
                 cc_max=cc_max,
                 dynamic_stretch=dynamic_stretch,
-                max_step=max_step,
+                fade_seconds=fade_seconds,
                 min_db=min_db,
                 max_db=max_db,
                 curve_exponent=curve_exponent,
@@ -858,10 +909,10 @@ def parse_args() -> argparse.Namespace:
         help="Normalize each track's peak to CC max and stretch its dynamics by this factor.",
     )
     parser.add_argument(
-        "--max-step",
-        type=int,
-        default=8,
-        help="Maximum CC change between consecutive events (smooths phrase edges).",
+        "--fade-seconds",
+        type=float,
+        default=0.15,
+        help="Linear fade-in/out length around each phrase (seconds).",
     )
     parser.add_argument(
         "--merge",
@@ -891,7 +942,7 @@ def main() -> None:
         cc_min=args.cc_min,
         cc_max=args.cc_max,
         dynamic_stretch=args.dynamic_stretch,
-        max_step=args.max_step,
+        fade_seconds=args.fade_seconds,
         min_db=args.min_db,
         max_db=args.max_db,
         curve_exponent=args.curve_exponent,
