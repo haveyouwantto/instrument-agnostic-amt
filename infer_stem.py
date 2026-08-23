@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import shutil
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
@@ -20,7 +21,11 @@ from infer_instrument_refinement import (
     ensure_refinement_checkpoint,
     refine_midi_instruments,
 )
-from infer_velocity import load_velocity_model, predict_velocity_for_stem_midis
+from infer_velocity import (
+    ensure_velocity_checkpoint,
+    load_velocity_model,
+    predict_velocity_for_stem_midis,
+)
 from instrument_agnostic_amt.whisper_lyrics import add_whisper_lyrics_to_vocals_midi
 from instrument_agnostic_amt.instrument_refinement.data.labels import (
     inference_stem_group,
@@ -260,15 +265,14 @@ def get_stem_pipeline_models(
     model_type: str = "default",
     low_vram_mode: bool = False,
     no_half: bool = False,
+    stem_splitter_batch_size: int = 1,
     compile_model: bool = False,
     compile_mode: str = "default",
 ) -> dict[str, object]:
-    """AMT とステム分離モデルを読み込み、セッション中は再利用する。
+    """AMT とステム分離モデルを読み込み、セッション中は再利用する。"""
+    if stem_splitter_batch_size < 1:
+        raise ValueError("stem_splitter_batch_size must be at least 1")
 
-    low_vram_mode=True の場合、モデルは CPU メモリに常駐させ、推論時にだけ
-    対象モデルを推論デバイス（通常 CUDA）へ移動する。これにより GPU 上に
-    置かれるモデルは常に 1 つだけになる。
-    """
     compute_device = resolve_device(device_preference)
 
     # 低显存模式：模型常驻 CPU 内存（RAM），仅在推理时搬运到 compute_device。
@@ -304,6 +308,7 @@ def get_stem_pipeline_models(
                     use_half_precision=False,
                     chunk_size=294_400,
                     hop_size=147_200,
+                    batch_size=int(stem_splitter_batch_size),
                 )
             else:
                 # 低显存モードでは分離を fp16 autocast で実行し、ピーク VRAM を抑える。
@@ -311,9 +316,13 @@ def get_stem_pipeline_models(
                 sep_config = SeparationConfig(
                     skip_existing=True,
                     use_half_precision=True,
+                    batch_size=int(stem_splitter_batch_size),
                 )
         else:
-            sep_config = SeparationConfig(skip_existing=True)
+            sep_config = SeparationConfig(
+                batch_size=int(stem_splitter_batch_size),
+                skip_existing=True,
+            )
         sep_model = load_mss_model(sep_config, device=storage_device)
         sep_dtype = (
             torch.float16
@@ -322,7 +331,10 @@ def get_stem_pipeline_models(
         )
         STEM_PIPELINE_CACHE[sep_cache_key] = (sep_config, sep_model, sep_dtype)
     else:
-        sep_config, sep_model, sep_dtype = STEM_PIPELINE_CACHE[sep_cache_key]
+        cached_sep_config, sep_model, sep_dtype = STEM_PIPELINE_CACHE[sep_cache_key]
+        # 分離モデルは共通のまま、今回の実行にだけバッチサイズを反映する。
+        sep_config = copy.copy(cached_sep_config)
+        sep_config.batch_size = int(stem_splitter_batch_size)
 
     if amt_cache_key not in STEM_PIPELINE_CACHE:
         print(f"Loading AMT model ({model_type}) on {storage_device} ...")
@@ -361,6 +373,46 @@ def get_stem_pipeline_models(
         "sep_model": sep_model,
         "sep_dtype": sep_dtype,
     }
+
+
+def get_velocity_models(
+    checkpoint_path: Path | str | None = None,
+    device_preference: torch.device | str | None = None,
+    *,
+    compile_velocity: bool = False,
+    compile_mode: str = "default",
+) -> tuple[object, object, object]:
+    """Velocityモデルとregional compile済みforwardを再利用する。"""
+    device = resolve_device(device_preference)
+    resolved_checkpoint = ensure_velocity_checkpoint(checkpoint_path)
+    compile_cache_key = (
+        ("compiled", str(compile_mode)) if compile_velocity else ("eager",)
+    )
+    cache_key = (
+        "velocity",
+        str(resolved_checkpoint.resolve()),
+        str(device),
+        *compile_cache_key,
+    )
+
+    cached = STEM_PIPELINE_CACHE.get(cache_key)
+    if cached is not None:
+        cached[0].to(device)
+        cached[0].eval()
+        return cached
+
+    model, config = load_velocity_model(
+        resolved_checkpoint,
+        device=device,
+    )
+    forward_model = maybe_compile_forward(
+        model,
+        enabled=bool(compile_velocity),
+        mode=str(compile_mode),
+    )
+    bundle = (model, forward_model, config)
+    STEM_PIPELINE_CACHE[cache_key] = bundle
+    return bundle
 
 
 def get_refinement_models(
@@ -514,6 +566,7 @@ def run_stem_separated_transcription(
     *,
     checkpoint_path: Path | str | None = None,
     output_root: Path | str = "colab_outputs",
+    stem_splitter_batch_size: int = 1,
     window_batch_size: int = 4,
     max_midi_melodic_instruments: int = 15,
     transcribe_drum_stems: bool = True,
@@ -536,6 +589,7 @@ def run_stem_separated_transcription(
     amp: bool = False,
     amp_dtype: str | None = None,
     compile_model: bool = False,
+    compile_velocity: bool = False,
     compile_mode: str = "default",
 ) -> dict[str, object]:
     """ステム分離 -> 各ステム採譜 -> 楽器再ラベリング -> MIDI マージ -> Velocity予測 -> Beat/Chord予測を一括実行する。
@@ -554,6 +608,7 @@ def run_stem_separated_transcription(
         model_type="default",
         low_vram_mode=low_vram_mode,
         no_half=no_half,
+        stem_splitter_batch_size=stem_splitter_batch_size,
         compile_model=compile_model,
         compile_mode=compile_mode,
     )
@@ -597,6 +652,7 @@ def run_stem_separated_transcription(
                 model_type=model_type_key,
                 low_vram_mode=low_vram_mode,
                 no_half=no_half,
+                stem_splitter_batch_size=stem_splitter_batch_size,
                 compile_model=compile_model,
                 compile_mode=compile_mode,
             )
@@ -616,7 +672,10 @@ def run_stem_separated_transcription(
         audio_file,
         temp_dir=run_root / "prepared_inputs",
     )
-    print(f"Separating stems for: {audio_file.name}")
+    print(
+        f"Separating stems for: {audio_file.name} "
+        f"(batch_size={stem_splitter_batch_size})"
+    )
     if low_vram_mode:
         print(f"[LowVRAM] Moving separation model to {device} ...")
         _move_model(sep_model, device)
@@ -796,16 +855,20 @@ def run_stem_separated_transcription(
             velocity_midi_path = merged_dir / f"{audio_file.stem}_velocity.mid"
             if low_vram_mode:
                 print("[LowVRAM] Loading velocity model on CPU ...")
-                velocity_model, velocity_config = load_velocity_model(
-                    velocity_checkpoint_path,
-                    device="cpu",
+                velocity_model, velocity_forward, velocity_config = get_velocity_models(
+                    checkpoint_path=velocity_checkpoint_path,
+                    device_preference="cpu",
+                    compile_velocity=compile_velocity,
+                    compile_mode=compile_mode,
                 )
                 print(f"[LowVRAM] Moving velocity model to {device} ...")
                 _move_model(velocity_model, device)
             else:
-                velocity_model, velocity_config = load_velocity_model(
-                    velocity_checkpoint_path,
-                    device=device,
+                velocity_model, velocity_forward, velocity_config = get_velocity_models(
+                    checkpoint_path=velocity_checkpoint_path,
+                    device_preference=device,
+                    compile_velocity=compile_velocity,
+                    compile_mode=compile_mode,
                 )
             preloaded_velocity_waveforms = {
                 stem_name: load_run_waveform(
@@ -825,8 +888,11 @@ def run_stem_separated_transcription(
                 window_seconds=8.0,
                 max_melodic_instruments=max_midi_melodic_instruments,
                 disable_tqdm=True,
+                compile_velocity=compile_velocity,
+                compile_mode=compile_mode,
                 preloaded_model=velocity_model,
                 preloaded_config=velocity_config,
+                preloaded_forward=velocity_forward,
                 preloaded_waveforms=preloaded_velocity_waveforms,
             )
             merged_midi_path = velocity_midi_path

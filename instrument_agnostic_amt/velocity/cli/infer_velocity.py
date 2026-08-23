@@ -15,11 +15,10 @@ import torch
 import torchaudio.functional as audio_functional
 from tqdm.auto import tqdm
 
+from ...runtime import maybe_compile_forward, resolve_device
 from ..modeling.checkpoints import load_checkpoint, select_state_dict
 from ..modeling.model import VelocityModelConfig, VelocityPredictionModel
 from ..training.dataset import STEM_CLASS_BY_NAME, STEM_NAMES, UNKNOWN_STEM_CLASS
-from ...runtime import resolve_device
-
 
 HF_CHECKPOINT_BASE_URL = (
     "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main"
@@ -404,8 +403,11 @@ def predict_velocity_for_stem_midis(
     max_melodic_instruments: int = 15,
     apply_stem_gain_to_cc7: bool = False,
     disable_tqdm: bool = False,
+    compile_velocity: bool = False,
+    compile_mode: str = "default",
     preloaded_model: VelocityPredictionModel | None = None,
     preloaded_config: VelocityModelConfig | None = None,
+    preloaded_forward: Any | None = None,
     preloaded_waveforms: Mapping[str, torch.Tensor] | None = None,
 ) -> Path | dict[str, Path]:
     """各ステムの音声とMIDIを対応づけ、ノートVelocityを予測して反映する。
@@ -418,6 +420,8 @@ def predict_velocity_for_stem_midis(
     target_device = resolve_device(device)
     if max_melodic_instruments < 0:
         raise ValueError("max_melodic_instruments must be nonnegative")
+    if window_seconds <= 0:
+        raise ValueError("window_seconds must be positive")
 
     if template_midi_path is not None and output_midi_path is None:
         raise ValueError('template_midi_path requires output_midi_path')
@@ -430,6 +434,10 @@ def predict_velocity_for_stem_midis(
         raise ValueError(
             "preloaded_model and preloaded_config must be provided together"
         )
+    if preloaded_forward is not None and preloaded_model is None:
+        raise ValueError(
+            "preloaded_forward requires preloaded_model and preloaded_config"
+        )
     if preloaded_model is None or preloaded_config is None:
         model, config = load_velocity_model(checkpoint_path, device=target_device)
     else:
@@ -437,6 +445,18 @@ def predict_velocity_for_stem_midis(
         config = preloaded_config
         model.to(target_device)
         model.eval()
+    forward_model = (
+        preloaded_forward
+        if preloaded_forward is not None
+        else maybe_compile_forward(
+            model,
+            enabled=bool(compile_velocity),
+            mode=str(compile_mode),
+        )
+    )
+    configure_stem_gain = (
+        isinstance(model, VelocityPredictionModel) and forward_model is model
+    )
     if apply_stem_gain_to_cc7 and not config.predict_stem_gain:
         raise ValueError(
             "This velocity checkpoint does not contain a stem-gain prediction head"
@@ -545,6 +565,8 @@ def predict_velocity_for_stem_midis(
 
     total_duration_seconds = float(max_samples) / float(config.sample_rate)
     window_samples = int(window_seconds * config.sample_rate)
+    if window_samples <= 0:
+        raise ValueError("window_seconds is too small for the model sample rate")
 
     if total_duration_seconds <= window_seconds:
         window_starts_seconds = [0.0]
@@ -554,7 +576,7 @@ def predict_velocity_for_stem_midis(
     predicted_velocities = np.full(len(flat_notes), 80, dtype=np.int32)
     predicted_stem_gains_db_list: list[np.ndarray] = []
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for win_start in tqdm(
             window_starts_seconds,
             desc="Predicting velocity",
@@ -593,16 +615,20 @@ def predict_velocity_for_stem_midis(
                 torch.from_numpy(stem_indices[indices_in_win]).unsqueeze(0).to(device=target_device)
             )
 
-            outputs = model(
-                sub_audio,
-                note_start_seconds=note_start_tensor,
-                note_end_seconds=note_end_tensor,
-                note_pitch=note_pitch_tensor,
-                note_program=note_program_tensor,
-                note_is_drum=note_is_drum_tensor,
-                note_stem_index=note_stem_index_tensor,
-                stem_class_id=stem_class_tensor,
-            )
+            forward_kwargs: dict[str, Any] = {
+                "note_start_seconds": note_start_tensor,
+                "note_end_seconds": note_end_tensor,
+                "note_pitch": note_pitch_tensor,
+                "note_program": note_program_tensor,
+                "note_is_drum": note_is_drum_tensor,
+                "note_stem_index": note_stem_index_tensor,
+                "stem_class_id": stem_class_tensor,
+            }
+            if configure_stem_gain:
+                forward_kwargs["include_stem_gain"] = bool(
+                    apply_stem_gain_to_cc7
+                )
+            outputs = forward_model(sub_audio, **forward_kwargs)
 
             velocity_expected = outputs["velocity_expected"].squeeze(0).cpu().numpy()
             velocity_clamped = np.clip(np.round(velocity_expected), 1, 127).astype(np.int32)
@@ -611,6 +637,7 @@ def predict_velocity_for_stem_midis(
             if "stem_gain_db" in outputs:
                 stem_gain_np = outputs["stem_gain_db"].squeeze(0).cpu().numpy()
                 predicted_stem_gains_db_list.append(stem_gain_np)
+            del outputs
 
     for idx, record in enumerate(flat_notes):
         record.note.velocity = int(predicted_velocities[idx])
@@ -688,6 +715,8 @@ def predict_velocity_for_midi(
     max_melodic_instruments: int = 15,
     apply_stem_gain_to_cc7: bool = False,
     disable_tqdm: bool = False,
+    compile_velocity: bool = False,
+    compile_mode: str = "default",
 ) -> Path:
     """単一のMIDIファイルを受け取った場合の互換用エントリポイント。"""
     midi_file_path = Path(midi_path)
@@ -727,6 +756,8 @@ def predict_velocity_for_midi(
         max_melodic_instruments=max_melodic_instruments,
         apply_stem_gain_to_cc7=apply_stem_gain_to_cc7,
         disable_tqdm=disable_tqdm,
+        compile_velocity=compile_velocity,
+        compile_mode=compile_mode,
     )
 
     for temp_p in stem_midis.values():
@@ -774,6 +805,23 @@ def parse_args() -> argparse.Namespace:
         help="Window size in seconds for long audio inference",
     )
     parser.add_argument(
+        "--compile-velocity",
+        dest="compile_velocity",
+        action="store_true",
+        help="Compile shared velocity-model Transformer regions with torch.compile",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=(
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ),
+        default="default",
+        help="torch.compile mode",
+    )
+    parser.add_argument(
         "--max-midi-melodic-instruments",
         type=int,
         default=15,
@@ -811,6 +859,8 @@ def main() -> None:
         window_seconds=args.window_seconds,
         max_melodic_instruments=args.max_midi_melodic_instruments,
         apply_stem_gain_to_cc7=args.apply_cc7_gain,
+        compile_velocity=args.compile_velocity,
+        compile_mode=args.compile_mode,
     )
     print(f"Successfully generated velocity-predicted MIDI: {output_path}")
 

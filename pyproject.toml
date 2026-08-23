@@ -25,9 +25,19 @@ stem = [
     "chord-romanizer",
     "faster-whisper",
     "librosa",
+    "moduleconf",
     "stem-splitter",
     "transkun",
     "ADTOF-pytorch @ git+https://github.com/xavriley/ADTOF-pytorch.git",
+]
+app = [
+    "aiofiles",
+    "fastapi",
+    "jinja2",
+    "pydantic",
+    "python-multipart",
+    "uvicorn",
+    "yt-dlp",
 ]
 training = [
     "audiomentations",
