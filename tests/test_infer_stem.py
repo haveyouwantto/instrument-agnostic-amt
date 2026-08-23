@@ -153,20 +153,158 @@ def test_stem_pipeline_compiles_and_caches_only_the_core_amt_forward(
     ]
 
 
+def test_velocity_pipeline_compile_is_independent_and_cached_by_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get_velocity_models = getattr(infer_stem, "get_velocity_models", None)
+    assert callable(get_velocity_models)
+    checkpoint = tmp_path / "velocity.pth"
+    checkpoint.write_bytes(b"")
+    eager_model = torch.nn.Linear(2, 2)
+    compiled_forward = object()
+    load_calls: list[tuple[Path, torch.device]] = []
+    compile_calls: list[tuple[object, bool, str]] = []
+
+    monkeypatch.setattr(
+        infer_stem,
+        "ensure_velocity_checkpoint",
+        lambda _path: checkpoint,
+        raising=False,
+    )
+
+    def fake_load(
+        path: Path,
+        *,
+        device: torch.device,
+    ) -> tuple[object, object]:
+        load_calls.append((path, device))
+        return eager_model, object()
+
+    monkeypatch.setattr(
+        infer_stem,
+        "load_velocity_model",
+        fake_load,
+        raising=False,
+    )
+
+    def fake_compile(
+        model: object,
+        *,
+        enabled: bool,
+        mode: str,
+    ) -> object:
+        compile_calls.append((model, enabled, mode))
+        return compiled_forward
+
+    monkeypatch.setattr(infer_stem, "maybe_compile_forward", fake_compile)
+    infer_stem.STEM_PIPELINE_CACHE.clear()
+
+    first = get_velocity_models(
+        checkpoint_path=checkpoint,
+        device_preference="cpu",
+        compile_velocity=True,
+        compile_mode="reduce-overhead",
+    )
+    second = get_velocity_models(
+        checkpoint_path=checkpoint,
+        device_preference="cpu",
+        compile_velocity=True,
+        compile_mode="reduce-overhead",
+    )
+    different_mode = get_velocity_models(
+        checkpoint_path=checkpoint,
+        device_preference="cpu",
+        compile_velocity=True,
+        compile_mode="max-autotune",
+    )
+
+    assert first is second
+    assert different_mode is not first
+    assert first[0] is eager_model
+    assert first[1] is compiled_forward
+    assert load_calls == [
+        (checkpoint, torch.device("cpu")),
+        (checkpoint, torch.device("cpu")),
+    ]
+    assert compile_calls == [
+        (eager_model, True, "reduce-overhead"),
+        (eager_model, True, "max-autotune"),
+    ]
+
+
 def test_stem_workflow_exposes_device_and_amp_options() -> None:
     parameters = signature(run_stem_separated_transcription).parameters
 
     assert (
+        parameters.get("stem_splitter_batch_size").default
+        if parameters.get("stem_splitter_batch_size")
+        else None,
         parameters.get("device").default if parameters.get("device") else None,
         parameters.get("amp").default if parameters.get("amp") else None,
         parameters.get("amp_dtype").default if parameters.get("amp_dtype") else "missing",
         parameters.get("compile_model").default
         if parameters.get("compile_model")
         else None,
+        parameters.get("compile_velocity").default
+        if parameters.get("compile_velocity")
+        else None,
         parameters.get("compile_mode").default
         if parameters.get("compile_mode")
         else None,
-    ) == ("auto", False, None, False, "default")
+    ) == (1, "auto", False, None, False, False, "default")
+
+
+def test_stem_pipeline_changes_separator_batch_size_without_reloading_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"")
+    separator_load_batch_sizes: list[int] = []
+
+    monkeypatch.setattr(
+        infer_stem.infer,
+        "_ensure_checkpoint",
+        lambda *_args, **_kwargs: checkpoint,
+    )
+    monkeypatch.setattr(
+        infer_stem.infer,
+        "_load_model_and_settings",
+        lambda *_args, **_kwargs: (object(), object(), object()),
+    )
+
+    def fake_load_separator(config: SimpleNamespace, **_kwargs: object) -> object:
+        separator_load_batch_sizes.append(config.batch_size)
+        return object()
+
+    monkeypatch.setattr(
+        infer_stem,
+        "load_mss_model",
+        fake_load_separator,
+    )
+    infer_stem.STEM_PIPELINE_CACHE.clear()
+
+    batch_one = get_stem_pipeline_models(
+        checkpoint_path=checkpoint,
+        device_preference="cpu",
+        stem_splitter_batch_size=1,
+    )
+    batch_four = get_stem_pipeline_models(
+        checkpoint_path=checkpoint,
+        device_preference="cpu",
+        stem_splitter_batch_size=4,
+    )
+
+    assert batch_one["sep_config"].batch_size == 1
+    assert batch_four["sep_config"].batch_size == 4
+    assert batch_one["sep_model"] is batch_four["sep_model"]
+    assert separator_load_batch_sizes == [1]
+
+
+def test_stem_pipeline_rejects_invalid_separator_batch_size() -> None:
+    with pytest.raises(ValueError, match="stem_splitter_batch_size"):
+        get_stem_pipeline_models(stem_splitter_batch_size=0)
 
 
 def test_merge_midis_logic(tmp_path: Path) -> None:
@@ -497,8 +635,8 @@ def _install_fake_waveform_cache_pipeline(
     monkeypatch.setattr(infer_stem, "refine_midi_instruments", fake_refine)
     monkeypatch.setattr(
         infer_stem,
-        "load_velocity_model",
-        lambda *_args, **_kwargs: (object(), velocity_config),
+        "get_velocity_models",
+        lambda **_kwargs: (object(), object(), velocity_config),
         raising=False,
     )
 
@@ -710,15 +848,14 @@ def test_stem_pipeline_velocity_ignores_a_missing_stem_during_preload(
     velocity_config = SimpleNamespace(sample_rate=16_000)
 
     def remove_other_before_velocity(
-        *_args: object,
         **_kwargs: object,
-    ) -> tuple[object, object]:
+    ) -> tuple[object, object, object]:
         pipeline.stems["other"].unlink()
-        return object(), velocity_config
+        return object(), object(), velocity_config
 
     monkeypatch.setattr(
         infer_stem,
-        "load_velocity_model",
+        "get_velocity_models",
         remove_other_before_velocity,
     )
 
