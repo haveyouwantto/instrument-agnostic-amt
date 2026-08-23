@@ -34,6 +34,9 @@ from instrument_agnostic_amt.runtime import (
     resolve_amp_dtype,
     resolve_device,
 )
+from instrument_agnostic_amt.expression.cli.infer_expression import (
+    apply_expression_to_merged_midi,
+)
 from instrument_agnostic_amt.taxonomy.instrument_classes import INSTRUMENT_CLASSES
 
 # セッション中にモデルを使い回して、再実行時の待ち時間を減らす。
@@ -537,12 +540,21 @@ def run_stem_separated_transcription(
     amp_dtype: str | None = None,
     compile_model: bool = False,
     compile_mode: str = "default",
+    predict_expression: bool = False,
+    expression_cc: int = 11,
+    expression_interval_seconds: float = 0.02,
+    expression_smoothing_seconds: float = 0.1,
+    expression_dynamic_stretch: float = 1.0,
 ) -> dict[str, object]:
-    """ステム分離 -> 各ステム採譜 -> 楽器再ラベリング -> MIDI マージ -> Velocity予測 -> Beat/Chord予測を一括実行する。
+    """ステム分離 -> 各ステム採譜 -> 楽器再ラベリング -> MIDI マージ -> Velocity予測 -> Beat/Chord予測 -> Expression(CC11)を一括実行する。
 
     low_vram_mode=True にすると、モデルをすべて CPU メモリに常駐させ、
     各ステムの採譜を行う直前に対象 AMT モデルだけを GPU へ移動し、
     終わったらすぐ CPU へ戻す。GPU に置かれるモデルは常に 1 つだけになる。
+
+    predict_expression=True の場合、最終マージ済み MIDI に対して持続音系の
+    楽器ごとに自前の音符基音エネルギーで検出したミリ秒粒度の CC11 カーブを
+    後処理として書き込む。
     """
     audio_file = Path(audio_path)
     if not audio_file.exists():
@@ -842,7 +854,27 @@ def run_stem_separated_transcription(
             if waveform_cache is not None:
                 waveform_cache.clear()
 
-    # 6.5 Beat, Chord, Key 予測を実行し、ビート・コード情報を MIDI に書き込む。
+    # 6.5 Expression(CC11)予測を実行し、持続音系楽器ごとの音量カーブを書き込む。
+    if predict_expression:
+        try:
+            print("Predicting per-instrument expression (CC11) from stems...")
+            expression_midi_path = merged_dir / f"{audio_file.stem}_expression.mid"
+            apply_expression_to_merged_midi(
+                merged_midi_path,
+                stem_midi_paths,
+                stems,
+                output_midi_path=expression_midi_path,
+                cc=expression_cc,
+                interval_seconds=expression_interval_seconds,
+                smoothing_seconds=expression_smoothing_seconds,
+                dynamic_stretch=expression_dynamic_stretch,
+            )
+            merged_midi_path = expression_midi_path
+            print("Updated merged MIDI with per-instrument expression (CC11):", merged_midi_path)
+        except Exception as err:
+            print(f"Warning: Expression prediction skipped due to error: {err}")
+
+    # 6.75 Beat, Chord, Key 予測を実行し、ビート・コード情報を MIDI に書き込む。
     if predict_beat_chord:
         try:
             print("Predicting beat, chord, key from MIDI...")
@@ -879,6 +911,7 @@ def run_stem_separated_transcription(
         "instruments_refined": instruments_refined,
         "velocity_predicted": predict_velocity,
         "beat_chord_predicted": predict_beat_chord,
+        "expression_predicted": predict_expression,
     }
     if instruments_refined:
         result["refined_stem_midi_dir"] = str(refined_stem_midi_dir)
