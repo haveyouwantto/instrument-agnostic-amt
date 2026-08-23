@@ -136,6 +136,162 @@ def estimate_loudness_curve(
     return times, db_values
 
 
+def _pitch_to_frequency(pitch: int, *, a4_freq: float = 440.0) -> float:
+    return float(a4_freq) * 2.0 ** ((int(pitch) - 69) / 12.0)
+
+
+def _pitch_to_stft_bin(
+    pitch: int,
+    sample_rate: int,
+    n_fft: int,
+) -> int:
+    frequency = _pitch_to_frequency(pitch)
+    return int(round(frequency * int(n_fft) / int(sample_rate)))
+
+
+def _stft_magnitude_spectrogram(
+    mono: np.ndarray,
+    sample_rate: int,
+    *,
+    n_fft: int,
+    hop_length: int,
+) -> tuple[np.ndarray, int]:
+    """Full magnitude spectrogram [frames, n_fft//2+1] with the flattop window."""
+    if mono.size < n_fft:
+        mono = np.pad(mono, (0, n_fft - int(mono.size)))
+    num_frames = 1 + (int(mono.size) - n_fft) // hop_length
+    window = flattop(n_fft).astype(np.float64)
+    spectrogram = np.empty(
+        (num_frames, n_fft // 2 + 1),
+        dtype=np.float32,
+    )
+    for frame_idx in range(num_frames):
+        start = frame_idx * hop_length
+        spectrum = np.abs(np.fft.rfft(mono[start : start + n_fft] * window))
+        spectrogram[frame_idx, :] = spectrum.astype(np.float32)
+    return spectrogram, num_frames
+
+
+def _spectrogram_from_audio(
+    audio_path: Path | str,
+    *,
+    n_fft: int,
+    hop_length: int,
+) -> tuple[np.ndarray, int]:
+    waveform, source_sr = sf.read(
+        str(audio_path), dtype="float32", always_2d=True
+    )
+    if waveform.shape[1] > 2:
+        waveform = waveform[:, :2]
+    mono = waveform.mean(axis=1).astype(np.float64)
+    spectrogram, _num_frames = _stft_magnitude_spectrogram(
+        mono,
+        int(source_sr),
+        n_fft=int(n_fft),
+        hop_length=int(hop_length),
+    )
+    return spectrogram, int(source_sr)
+
+
+def _frame_range(
+    start_seconds: float,
+    end_seconds: float,
+    frame_times: np.ndarray,
+) -> tuple[int, int]:
+    start_frame = int(np.searchsorted(frame_times, start_seconds, side="left"))
+    end_frame = int(np.searchsorted(frame_times, end_seconds, side="right")) - 1
+    start_frame = max(0, start_frame)
+    end_frame = min(int(frame_times.shape[0]) - 1, end_frame)
+    if end_frame < start_frame:
+        return -1, -1
+    return start_frame, end_frame
+
+
+def instrument_curve_from_spectrogram(
+    spectrogram: np.ndarray,
+    sample_rate: int,
+    notes: Sequence[pretty_midi.Note],
+    *,
+    n_fft: int,
+    hop_length: int,
+    smoothing_seconds: float = 0.1,
+    min_active_db: float = -60.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-instrument dB curve from its own notes' fundamental energy.
+
+    For each STFT frame, the strongest magnitude among the fundamental bins
+    of the notes that are sounding at that moment is used, so every instrument
+    receives its own loudness curve instead of sharing the stem-level one.
+    Frames where the instrument has no active note are dropped.
+    """
+    num_frames = int(spectrogram.shape[0])
+    if num_frames == 0 or not notes:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+    frame_times = (
+        np.arange(num_frames, dtype=np.float64) * float(hop_length) / float(sample_rate)
+    )
+    db_values = np.full(num_frames, -120.0, dtype=np.float64)
+
+    for note in notes:
+        start_frame, end_frame = _frame_range(
+            float(note.start),
+            float(note.end),
+            frame_times,
+        )
+        if start_frame < 0:
+            continue
+        bin_index = _pitch_to_stft_bin(int(note.pitch), int(sample_rate), int(n_fft))
+        low_bin = max(1, bin_index - 1)
+        high_bin = min(int(spectrogram.shape[1]) - 1, bin_index + 2)
+        for frame_idx in range(start_frame, end_frame + 1):
+            magnitude = float(
+                np.max(spectrogram[frame_idx, low_bin:high_bin])
+            )
+            frame_db = 20.0 * np.log10(max(magnitude, 1e-10))
+            if frame_db > db_values[frame_idx]:
+                db_values[frame_idx] = frame_db
+
+    kernel = max(
+        1,
+        int(round(float(smoothing_seconds) * int(sample_rate) / float(hop_length))),
+    )
+    if db_values.shape[0] >= kernel:
+        padded = np.pad(
+            db_values,
+            (kernel // 2, kernel - 1 - kernel // 2),
+            mode="edge",
+        )
+        kernel_array = np.ones(kernel, dtype=np.float64) / float(kernel)
+        db_values = np.convolve(padded, kernel_array, mode="valid")
+
+    active = db_values > float(min_active_db)
+    return frame_times[active], db_values[active]
+
+
+def estimate_instrument_loudness_curve(
+    audio_path: Path | str,
+    notes: Sequence[pretty_midi.Note],
+    *,
+    n_fft: int = 2048,
+    hop_length: int = 512,
+    smoothing_seconds: float = 0.1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convenience wrapper: spectrogram + per-instrument curve for one track."""
+    spectrogram, sample_rate = _spectrogram_from_audio(
+        audio_path,
+        n_fft=int(n_fft),
+        hop_length=int(hop_length),
+    )
+    return instrument_curve_from_spectrogram(
+        spectrogram,
+        sample_rate,
+        notes,
+        n_fft=int(n_fft),
+        hop_length=int(hop_length),
+        smoothing_seconds=smoothing_seconds,
+    )
+
+
 def _db_to_cc(
     db_value: float,
     *,
@@ -280,6 +436,7 @@ def apply_expression_to_midi(
     cc_min: int = 8,
     cc_max: int = 127,
     dynamic_stretch: float = 1.0,
+    smoothing_seconds: float = 0.1,
     min_db: float = 0.0,
     max_db: float = 48.0,
     curve_exponent: float = 1.2,
@@ -379,6 +536,7 @@ def apply_expression_to_merged_midi(
     cc_min: int = 8,
     cc_max: int = 127,
     dynamic_stretch: float = 1.0,
+    smoothing_seconds: float = 0.1,
     min_db: float = 0.0,
     max_db: float = 48.0,
     curve_exponent: float = 1.2,
@@ -386,8 +544,9 @@ def apply_expression_to_merged_midi(
     """Write CC expression curves onto the merged MIDI, keeping its tempo map.
 
     Each sustained instrument of the merged file is mapped back to the stem
-    that produced it (by program / drum flag / instrument name) and uses that
-    stem's full-audio loudness curve.
+    that produced it (by program / drum flag / instrument name) and gets its
+    own loudness curve by tracking the fundamental energy of its own notes in
+    that stem's STFT spectrogram.
     """
     merged_path = Path(merged_midi_path)
     midi_obj = pretty_midi.PrettyMIDI(str(merged_path))
@@ -419,7 +578,7 @@ def apply_expression_to_merged_midi(
             for inst in pm_obj.instruments
         }
 
-    curve_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    spectrogram_cache: dict[str, tuple[np.ndarray, int]] = {}
     changed = 0
     for instrument in midi_obj.instruments:
         key = (int(instrument.program), bool(instrument.is_drum), str(instrument.name))
@@ -440,13 +599,23 @@ def apply_expression_to_merged_midi(
                 f"skipping {instrument.name}"
             )
             continue
-        if stem_name not in curve_cache:
-            curve_cache[stem_name] = estimate_loudness_curve(
+        if stem_name not in spectrogram_cache:
+            spectrogram_cache[stem_name] = _spectrogram_from_audio(
                 audio_path,
                 n_fft=n_fft,
                 hop_length=hop_length,
             )
-        curve_times, curve_values = curve_cache[stem_name]
+        spectrogram, sample_rate = spectrogram_cache[stem_name]
+        curve_times, curve_values = instrument_curve_from_spectrogram(
+            spectrogram,
+            sample_rate,
+            instrument.notes,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            smoothing_seconds=smoothing_seconds,
+        )
+        if curve_times.shape[0] == 0:
+            continue
         if _apply_expression_to_instrument(
             instrument,
             curve_times,
@@ -485,13 +654,16 @@ def predict_expression_for_stem_midis(
     cc_min: int = 8,
     cc_max: int = 127,
     dynamic_stretch: float = 1.0,
+    smoothing_seconds: float = 0.1,
     min_db: float = 0.0,
     max_db: float = 48.0,
     curve_exponent: float = 1.2,
     quiet: bool = False,
 ) -> dict[str, Path]:
-    """Apply CC expression curves to each stem MIDI using its full audio.
+    """Apply per-instrument CC expression curves to each stem MIDI.
 
+    Every sustained instrument tracks the fundamental energy of its own notes
+    in the stem audio's STFT spectrogram, so each track gets its own curve.
     Returns a mapping of stem name -> output MIDI path.
     """
     if isinstance(stem_midis, Mapping):
@@ -523,26 +695,48 @@ def predict_expression_for_stem_midis(
             print(f"[Expression] WARNING: no audio found for {midi_path.name}, skipping")
             continue
 
-        curve_times, curve_values = estimate_loudness_curve(
+        spectrogram, sample_rate = _spectrogram_from_audio(
             audio_path,
             n_fft=n_fft,
             hop_length=hop_length,
         )
         midi_obj = pretty_midi.PrettyMIDI(str(midi_path))
-        changed = apply_expression_to_midi(
-            midi_obj,
-            curve_times,
-            curve_values,
-            cc=cc,
-            sustained_ranges=sustained_ranges,
-            interval_seconds=interval_seconds,
-            cc_min=cc_min,
-            cc_max=cc_max,
-            dynamic_stretch=dynamic_stretch,
-            min_db=min_db,
-            max_db=max_db,
-            curve_exponent=curve_exponent,
-        )
+        changed = 0
+        for instrument in midi_obj.instruments:
+            if not _is_sustained(
+                int(instrument.program),
+                bool(instrument.is_drum),
+                sustained_ranges,
+            ):
+                continue
+            if not instrument.notes:
+                continue
+            curve_times, curve_values = instrument_curve_from_spectrogram(
+                spectrogram,
+                sample_rate,
+                instrument.notes,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                smoothing_seconds=smoothing_seconds,
+            )
+            if curve_times.shape[0] == 0:
+                continue
+            if _apply_expression_to_instrument(
+                instrument,
+                curve_times,
+                curve_values,
+                cc=cc,
+                sustained_ranges=sustained_ranges,
+                interval_seconds=interval_seconds,
+                cc_min=cc_min,
+                cc_max=cc_max,
+                dynamic_stretch=dynamic_stretch,
+                min_db=min_db,
+                max_db=max_db,
+                curve_exponent=curve_exponent,
+                midi=midi_obj,
+            ):
+                changed += 1
         if in_place:
             output_path = midi_path
         else:
@@ -621,6 +815,12 @@ def parse_args() -> argparse.Namespace:
         default=20.0,
         help="CC event grid interval in milliseconds (default 20 ms).",
     )
+    parser.add_argument(
+        "--smoothing-seconds",
+        type=float,
+        default=0.1,
+        help="Per-instrument dB curve smoothing in seconds.",
+    )
     parser.add_argument("--min-db", type=float, default=0.0, help="Minimum dB for the CC mapping.")
     parser.add_argument("--max-db", type=float, default=48.0, help="Maximum dB for the CC mapping.")
     parser.add_argument(
@@ -661,6 +861,7 @@ def main() -> None:
         n_fft=args.n_fft,
         hop_length=args.hop_length,
         interval_seconds=args.cc_interval_ms / 1000.0,
+        smoothing_seconds=args.smoothing_seconds,
         cc_min=args.cc_min,
         cc_max=args.cc_max,
         dynamic_stretch=args.dynamic_stretch,
