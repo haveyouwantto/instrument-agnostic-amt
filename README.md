@@ -48,6 +48,8 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 |---|---|
 | 2026-08-19 | 🎻 Added other-instrument model v1.5 (`--type other_v1_5`). The Colab stem-separated workflow now uses it by default for `other` stems. On an in-house real-recording evaluation set, COnP improves from 0.7318 (`other`) to 0.7701 (`other_v1_5`). |
 | 2026-08-09 | 🎹 Added the Instrument Refinement model, which re-assigns instrument classes to AMT notes using the separated stem audio. It pulls timbrally close sounds onto a single class, so the instrument stops flickering within a piece and manual clean-up gets easier. Overall top-1 on the held-out RWC-I benchmark improves from 71.3% to 74.5%, but **individual instruments both gain and lose** — see [RWC-I benchmark](instrument_agnostic_amt/instrument_refinement/RWC_BENCHMARK.md) for the per-instrument breakdown and what each instrument is confused with. |
+| 2026-08-06 | 🧠 Added a low VRAM mode for the stem-separated workflow: all models stay resident in CPU RAM and are moved to the GPU only while their stem is being processed, so at most one model occupies VRAM at a time. Includes fp16 autocast for stem separation and an fp32 half-chunk fallback. |
+| 2026-07-31 | 🎤 Added faster-whisper-based word-level lyrics transcription for the vocals stem, inserted into the merged MIDI as Lyric meta events. |
 | 2026-07-30 | Added beat, chord, and key inference models to the pipeline. Disabled by default. |
 | 2026-07-24 | Added a dedicated velocity prediction model that estimates per-note dynamics from separated stem audio. The Colab stem-separated workflow now enables velocity prediction by default and automatically downloads the velocity checkpoint from Hugging Face. |
 | 2026-07-22 | Added guitar model v1.5 (`--type guitar_v1_5`). The Colab stem-separated workflow now uses it by default for guitar stems. |
@@ -178,7 +180,8 @@ instrument_agnostic_amt/
 ├── instrument_merge.json       # Instrument taxonomy definition
 ├── gm_instrument_classes.json  # General MIDI metadata
 ├── dataset_config.yaml         # Multi-dataset weighted sampling config
-├── requirements.txt            # Dependencies
+├── pyproject.toml              # Project metadata and dependencies (uv)
+├── uv.lock                     # Locked dependency versions
 │
 ├── models/
 │   ├── model.py                # AudioSemiCRFTransformer (top-level model)
@@ -201,24 +204,36 @@ instrument_agnostic_amt/
 
 ### Requirements
 
-- Python 3.10+
-- CUDA GPU (12GB+ VRAM recommended)
+- Python 3.10 – 3.14
+- [uv](https://docs.astral.sh/uv/) for dependency management
+- PyTorch 2.13.0 / torchaudio 2.11.0 — installed automatically from `uv.lock`
+- NVIDIA GPU (12GB+ VRAM recommended), Apple Silicon Mac, or CPU
+
+> Linux and Windows resolve to the CUDA 13.0 wheels. Apple Silicon macOS
+> resolves to the platform PyTorch wheels; PyTorch 2.13 does not provide Intel
+> macOS wheels.
 
 ```bash
 # Clone
 git clone https://github.com/anime-song/instrument-agnostic-amt.git
 cd instrument-agnostic-amt
 
-# Virtual environment
-python -m venv .venv
-source .venv/bin/activate  # Linux/macOS
-# .venv\Scripts\activate   # Windows
+# Core inference dependencies, using the exact versions in uv.lock
+uv sync --locked
 
-# Dependencies
-pip install -r requirements.txt
+# Optional workflows
+uv sync --locked --extra stem        # stem-separated inference
+uv sync --locked --extra evaluation  # evaluation scripts
+uv sync --locked --extra training    # training dependencies
 ```
 
-> `audiomentations` is needed for training augmentation. You can skip it if you only need inference.
+`uv sync` creates `.venv/`. Activate it with `source .venv/bin/activate`, or
+prefix commands with `uv run`, for example `uv run python infer.py --audio input.wav`.
+
+The repository's `.python-version` selects Python 3.12 as the default development
+interpreter without narrowing the supported Python 3.10–3.14 range. If Python
+3.12 is unavailable, uv downloads a managed CPython automatically unless Python
+downloads are disabled or the machine is offline.
 
 ---
 
@@ -455,6 +470,42 @@ python infer.py --audio input_song.wav
 
 > **Note**: If `--checkpoint` is not provided, the model will be automatically downloaded from Hugging Face.
 
+### Device selection
+
+`--device` defaults to `auto` and selects the first available backend in the
+order **CUDA → MPS → CPU**. You can also pin a backend explicitly; requesting
+an unavailable accelerator raises an error instead of silently falling back.
+
+```bash
+python infer.py --audio input_song.wav                # auto: CUDA → MPS → CPU
+python infer.py --audio input_song.wav --device mps   # Apple Silicon GPU
+python infer.py --audio input_song.wav --device cpu
+```
+
+MPS requires an Apple Silicon Mac with a PyTorch MPS backend. If PyTorch reports
+that an operation is unsupported on MPS, retry with `--device cpu`. Small
+floating-point differences between CPU, CUDA, and MPS results are expected.
+Mixed precision remains opt-in with `--amp`; on MPS its default dtype is fp16
+and can be changed with `--amp-dtype`.
+
+### Optional regional compilation
+
+`--compile` enables `torch.compile` only for the time- and band-axis
+Transformer blocks shared by the AMT backbone. Feature extraction, prediction
+heads, Semi-CRF decoding, and MIDI processing remain eager. This regional
+strategy is used for both full and partial inference windows.
+
+```bash
+python infer.py --audio input_song.wav --compile
+python infer.py --audio input_song.wav --compile --compile-mode max-autotune
+```
+
+Compilation is opt-in because the first processed window includes a cold
+compile cost. A short, one-off transcription may therefore be slower; it is
+most useful when the loaded model continues to process more windows or songs.
+`--compile-mode` also accepts `default`, `reduce-overhead`, and
+`max-autotune-no-cudagraphs`.
+
 ### Stem-separated workflow in Google Colab
 
 The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) includes an optional workflow that:
@@ -514,7 +565,9 @@ python infer.py \
   --checkpoint checkpoints/checkpoint_epoch_100.pth \
   --audio input_song.wav \
   --output-midi output.mid \
+  --device auto \
   --amp \
+  --compile \
   --window-ms 8000 \
   --stride-ms 4000 \
   --window-batch-size 4 \
@@ -530,7 +583,11 @@ python infer.py \
 | `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: original bass model. `bass_v2`: updated bass model. `vocal`: fine-tuned for vocal. `guitar`: original guitar model. `guitar_v1_5`: updated guitar model. `vocal_harmony`: fine-tuned for vocal harmony. `drums`: **Experimental** drum-focused model. `other`: fine-tuned for other instruments. |
 | `--audio` | (required) | Input audio path |
 | `--output-midi` | `<audio>.mid` | Output MIDI path |
-| `--amp` | `false` | Enable mixed precision inference |
+| `--device` | `auto` | Inference device. `auto` selects CUDA → MPS → CPU; `cuda`, `mps`, or `cpu` can be set explicitly |
+| `--amp` | `false` | Enable mixed precision inference on CUDA or MPS |
+| `--amp-dtype` | device default | `fp16` or `bf16`; defaults to bf16 on supported CUDA devices and fp16 on MPS |
+| `--compile` | `false` | Opt in to regional `torch.compile` for the AMT backbone Transformer blocks |
+| `--compile-mode` | `default` | Compilation mode: `default`, `reduce-overhead`, `max-autotune`, or `max-autotune-no-cudagraphs` |
 | `--window-ms` | training value | Inference window size (ms) |
 | `--stride-ms` | `window-ms / 2` | Window stride |
 | `--window-batch-size` | `1` | Windows to process at once |

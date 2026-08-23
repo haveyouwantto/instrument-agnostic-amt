@@ -49,6 +49,8 @@
 |---|---|
 | 2026-08-19 | 🎻 その他楽器モデル v1.5（`--type other_v1_5`）を追加。Colab のステム分離ワークフローでは、`other` ステムの既定モデルとして使用します。独自の実音源評価データセットでは COnP が 0.7318（`other`）から 0.7701（`other_v1_5`）に向上しました。 |
 | 2026-08-09 | 🎹 分離ステムを使って AMT のノートに楽器クラスを振り直す Instrument Refinement モデルを追加しました。音色の近いものを同じクラスにまとめるので、1 曲の中で楽器がころころ入れ替わることが減り、手作業で修正する際の一貫性が高くなります。学習に使っていない RWC-I ベンチマークでは全体の top-1 が 71.3% から 74.5% に向上しましたが、**楽器単体で見ると上がったものと下がったものがあります**。楽器ごとの増減と、どの楽器がどの楽器に間違われるかは [RWC-I ベンチマーク](instrument_agnostic_amt/instrument_refinement/RWC_BENCHMARK_ja.md) を参照してください。 |
+| 2026-08-06 | 🧠 ステム分離ワークフローに低 VRAM モードを追加。全モデルを CPU メモリに常駐させ、ステム処理の直前に対象モデルだけを GPU へ移動するため、VRAM に載るモデルは常に 1 つだけになります。分離は fp16 autocast（または fp32 半チャンク）で実行します。 |
+| 2026-07-31 | 🎤 vocals ステムに faster-whisper による単語単位の歌詞認識を追加。認識した歌詞はマージ後の MIDI に Lyric メタイベントとして埋め込みます。 |
 | 2026-07-30 | ビート・コード・キーの推論モデルをパイプラインに追加しました。デフォルトでは無効になっています。 |
 | 2026-07-24 | 分離ステムからノートごとの強弱を推定する velocity 予測専用モデルを追加。Colab のステム分離ワークフローでは velocity 予測をデフォルトで有効にし、velocity チェックポイントを Hugging Face から自動取得します。 |
 | 2026-07-22 | ギター専用モデル v1.5（`--type guitar_v1_5`）を追加。Colab のステム分離ワークフローでは、ギターステムの既定モデルとして使用します。 |
@@ -179,7 +181,8 @@ instrument_agnostic_amt/
 ├── instrument_merge.json       # 楽器分類の定義
 ├── gm_instrument_classes.json  # General MIDI メタデータ
 ├── dataset_config.yaml         # データセットの重み付け設定
-├── requirements.txt            # 依存パッケージ
+├── pyproject.toml              # プロジェクト定義と依存パッケージ（uv）
+├── uv.lock                     # 依存バージョンのロックファイル
 │
 ├── models/
 │   ├── model.py                # AudioSemiCRFTransformer（モデル本体）
@@ -202,24 +205,35 @@ instrument_agnostic_amt/
 
 ### 必要なもの
 
-- Python 3.10+
-- CUDA 対応 GPU（VRAM 12GB 以上推奨）
+- Python 3.10 〜 3.14
+- [uv](https://docs.astral.sh/uv/)（依存パッケージ管理）
+- PyTorch 2.13.0 / torchaudio 2.11.0 — `uv.lock` から自動でインストールされます
+- NVIDIA GPU（VRAM 12GB 以上推奨）、Apple Silicon Mac、または CPU
+
+> Linux / Windows では CUDA 13.0 wheel、Apple Silicon macOS では
+> プラットフォーム向けのPyTorch wheelを解決します。PyTorch 2.13 はIntel Mac
+> 向けwheelを提供していません。
 
 ```bash
 # クローン
 git clone https://github.com/anime-song/instrument-agnostic-amt.git
 cd instrument-agnostic-amt
 
-# 仮想環境
-python -m venv .venv
-source .venv/bin/activate  # Linux/macOS
-# .venv\Scripts\activate   # Windows
+# uv.lock のバージョンに固定した推論用コア依存パッケージ
+uv sync --locked
 
-# 依存パッケージ
-pip install -r requirements.txt
+# 用途別のオプション依存
+uv sync --locked --extra stem        # ステム分離推論
+uv sync --locked --extra evaluation  # 評価スクリプト
+uv sync --locked --extra training    # 学習用依存パッケージ
 ```
 
-> `audiomentations` は学習時のオーグメンテーションで使います。推論だけなら入れなくても動きます。
+`uv sync` は `.venv/` を作成します。`source .venv/bin/activate` で有効化するか、
+`uv run python infer.py --audio input.wav` のように各コマンドへ `uv run` を付けてください。
+
+リポジトリの `.python-version` は、対応範囲を狭めずに開発環境の既定を
+Python 3.12 へ揃えます。Python 3.12 が未導入の場合、Python の自動取得を
+無効化しているかオフラインでない限り、uv が管理する CPython を自動取得します。
 
 ---
 
@@ -413,6 +427,42 @@ python infer.py --audio input_song.wav
 
 > **Note**: `--checkpoint` を指定しない場合、自動的に Hugging Face から最新のモデルがダウンロードされます。
 
+### デバイス選択
+
+`--device` のデフォルトは `auto` で、**CUDA → MPS → CPU** の順に利用可能な
+バックエンドを選びます。デバイスを明示することもでき、利用できないアクセラレータを
+指定した場合は、暗黙にフォールバックせずエラーで停止します。
+
+```bash
+python infer.py --audio input_song.wav                # auto: CUDA → MPS → CPU
+python infer.py --audio input_song.wav --device mps   # Apple Silicon GPU
+python infer.py --audio input_song.wav --device cpu
+```
+
+MPS を使うには、PyTorch の MPS バックエンドを利用できる Apple Silicon Mac が必要です。
+PyTorch が MPS 未対応の演算を報告した場合は、`--device cpu` で再実行してください。
+CPU・CUDA・MPS 間では、浮動小数点演算による小さな結果差が生じることがあります。
+混合精度は `--amp` を指定した場合だけ有効になり、MPS のデフォルトdtypeはfp16です。
+`--amp-dtype` で変更できます。
+
+### regional コンパイル（任意）
+
+`--compile` を指定すると、AMT の共有バックボーンにある time 軸 / band 軸
+Transformer ブロックだけを `torch.compile` します。特徴抽出、予測ヘッド、
+Semi-CRF デコード、MIDI 処理は eager のままです。フル窓と末尾の端数窓は、
+どちらも同じ regional コンパイル済みモデルを使います。
+
+```bash
+python infer.py --audio input_song.wav --compile
+python infer.py --audio input_song.wav --compile --compile-mode max-autotune
+```
+
+最初のウィンドウには初回コンパイルの時間が含まれるため、`--compile` は既定で
+無効です。短い曲を 1 回だけ処理する場合は遅くなることがあり、ロード済みモデルで
+複数のウィンドウや曲を続けて処理する場合に向いています。`--compile-mode` には
+`default`、`reduce-overhead`、`max-autotune`、`max-autotune-no-cudagraphs`
+を指定できます。
+
 ### Google Colab のステム分離ワークフロー
 
 Google Colab 用ノートブック [`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、以下のオプション機能があります。
@@ -472,7 +522,9 @@ python infer.py \
   --checkpoint checkpoints/checkpoint_epoch_100.pth \
   --audio input_song.wav \
   --output-midi output.mid \
+  --device auto \
   --amp \
+  --compile \
   --window-ms 8000 \
   --stride-ms 4000 \
   --window-batch-size 4 \
@@ -488,7 +540,11 @@ python infer.py \
 | `--type` | `default` | ダウンロードするモデルの種類。`default`: 全楽器用、`bass`: 従来のベース専用モデル、`bass_v2`: 新しいベース専用モデル、`vocal`: ボーカル専用モデル、`guitar`: 従来のギター専用モデル、`guitar_v1_5`: 新しいギター専用モデル、`vocal_harmony`: ボーカルハモリモデル、`drums`: **実験的 (Experimental)** なドラム専用モデル、`other`: その他楽器専用モデル |
 | `--audio` | （必須） | 入力オーディオのパス |
 | `--output-midi` | `<audio>.mid` | 出力 MIDI のパス |
-| `--amp` | `false` | 混合精度推論を有効化 |
+| `--device` | `auto` | 推論デバイス。`auto` は CUDA → MPS → CPU の順に選択。`cuda`、`mps`、`cpu` の明示指定も可能 |
+| `--amp` | `false` | CUDA または MPS で混合精度推論を有効化 |
+| `--amp-dtype` | デバイス既定 | `fp16` または `bf16`。対応CUDAではbf16、MPSではfp16が既定 |
+| `--compile` | `false` | AMT バックボーンの Transformer ブロックだけを regional `torch.compile` する |
+| `--compile-mode` | `default` | `default`、`reduce-overhead`、`max-autotune`、`max-autotune-no-cudagraphs` から選択 |
 | `--window-ms` | 学習時の値 | 推論ウィンドウサイズ (ms) |
 | `--stride-ms` | `window-ms / 2` | ウィンドウのストライド |
 | `--window-batch-size` | `1` | まとめて処理するウィンドウ数 |

@@ -18,6 +18,7 @@ from tqdm.auto import tqdm
 from ..modeling.checkpoints import load_checkpoint, select_state_dict
 from ..modeling.model import VelocityModelConfig, VelocityPredictionModel
 from ..training.dataset import STEM_CLASS_BY_NAME, STEM_NAMES, UNKNOWN_STEM_CLASS
+from ...runtime import resolve_device
 
 
 HF_CHECKPOINT_BASE_URL = (
@@ -405,17 +406,16 @@ def predict_velocity_for_stem_midis(
     disable_tqdm: bool = False,
     preloaded_model: VelocityPredictionModel | None = None,
     preloaded_config: VelocityModelConfig | None = None,
+    preloaded_waveforms: Mapping[str, torch.Tensor] | None = None,
 ) -> Path | dict[str, Path]:
     """各ステムの音声とMIDIを対応づけ、ノートVelocityを予測して反映する。
 
     Velocity-only推論ではCC7 VolumeとCC11 Expressionを127へ固定し、学習renderと
     同じ基準でノートVelocityを唯一の可変音量表現にする。template_midi_pathを
     指定した場合は、そのMIDIのNote Onイベントへ予測値だけを書き戻す。
+    preloaded_waveforms にはconfig.sample_rateへresample済みのCPU float32ステレオ波形を渡せる。
     """
-    if device is None:
-        target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        target_device = torch.device(device)
+    target_device = resolve_device(device)
     if max_melodic_instruments < 0:
         raise ValueError("max_melodic_instruments must be nonnegative")
 
@@ -442,6 +442,27 @@ def predict_velocity_for_stem_midis(
             "This velocity checkpoint does not contain a stem-gain prediction head"
         )
     resolved_audios = _resolve_stem_files(stem_audios)
+    cached_waveforms = {
+        str(name).lower(): waveform
+        for name, waveform in (preloaded_waveforms or {}).items()
+    }
+
+    def resolve_waveform(name: str, path: Path) -> np.ndarray:
+        cached = cached_waveforms.get(name.lower())
+        if cached is None:
+            return _load_and_preprocess_audio(
+                path,
+                target_sample_rate=config.sample_rate,
+            )
+        if cached.device.type != "cpu":
+            raise ValueError("preloaded_waveforms must be on CPU")
+        if cached.dtype != torch.float32:
+            raise ValueError("preloaded_waveforms must have dtype float32")
+        if cached.ndim != 2 or int(cached.shape[0]) != 2:
+            raise ValueError("preloaded_waveforms must have shape [2, T]")
+        waveform = cached.detach().numpy()
+        waveform.flags.writeable = False
+        return waveform
 
     resolved_midis: dict[str, Path] = {}
     for key, val in stem_midis.items():
@@ -458,13 +479,10 @@ def predict_velocity_for_stem_midis(
 
     for name in active_stem_names:
         if name in resolved_audios:
-            waveform = _load_and_preprocess_audio(
-                resolved_audios[name],
-                target_sample_rate=config.sample_rate,
-            )
+            waveform = resolve_waveform(name, resolved_audios[name])
         else:
-            first_wave = next(iter(resolved_audios.values()))
-            ref_wave = _load_and_preprocess_audio(first_wave, target_sample_rate=config.sample_rate)
+            first_name, first_wave = next(iter(resolved_audios.items()))
+            ref_wave = resolve_waveform(first_name, first_wave)
             waveform = np.zeros_like(ref_wave)
 
         stem_waveforms.append(waveform)
@@ -746,8 +764,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         type=str,
-        default=None,
-        help="Device for inference (cuda or cpu)",
+        default="auto",
+        help="Device for inference (auto, cuda, mps, or cpu)",
     )
     parser.add_argument(
         "--window-seconds",
