@@ -99,15 +99,16 @@ def test_expression_cc_follows_loudness(tmp_path) -> None:
 
 
 def _value_at_or_before(
-    events: list[pretty_midi.ControlChange],
+    events: list[pretty_midi.ControlChange] | list[tuple[float, int]],
     target_time: float,
 ) -> int | None:
     """CC state at ``target_time`` (the last event at or before it)."""
     value = None
     for event in events:
-        if event.time > target_time:
+        time_value = event.time if hasattr(event, "time") else event[0]
+        if time_value > target_time:
             break
-        value = int(event.value)
+        value = int(event.value if hasattr(event, "value") else event[1])
     return value
 
 
@@ -132,15 +133,21 @@ def test_frame_events_are_millisecond_resolution() -> None:
     assert all(a < b for a, b in zip(times, times[1:]))
 
 
-def test_frame_events_fade_in_out_keep_transients() -> None:
+def test_frame_events_pre_and_post_roll() -> None:
     midi = pretty_midi.PrettyMIDI(resolution=480)
-    notes = [pretty_midi.Note(velocity=90, pitch=67, start=0.5, end=1.5)]
-    curve_times = np.arange(0.4, 1.6, 0.02)
-    # Alternating quiet/loud frames inside the phrase to expose transients.
+    notes = [
+        pretty_midi.Note(velocity=90, pitch=67, start=0.5, end=1.5),
+        pretty_midi.Note(velocity=90, pitch=67, start=2.5, end=3.5),
+    ]
+    curve_times = np.arange(0.4, 3.6, 0.02)
+    # First phrase: loud (40/10 dB alternating for transients). Second phrase:
+    # mid-loud (20 dB). The gap in between must produce no events.
+    in_first = (curve_times >= 0.5) & (curve_times <= 1.5)
+    in_second = (curve_times >= 2.5) & (curve_times <= 3.5)
     curve_values = np.where(
-        np.arange(int(curve_times.shape[0])) % 2 == 0,
-        10.0,
-        40.0,
+        in_first,
+        np.where(np.arange(int(curve_times.shape[0])) % 2 == 0, 10.0, 40.0),
+        np.where(in_second, 20.0, 6.0),
     )
     events = build_frame_cc_events(
         midi,
@@ -150,21 +157,21 @@ def test_frame_events_fade_in_out_keep_transients() -> None:
         interval_seconds=0.02,
         cc_min=8,
         cc_max=127,
-        fade_seconds=0.15,
     )
     assert events
-    fade_in = [event for event in events if event[0] < 0.5]
-    fade_out = [event for event in events if event[0] > 1.5]
-    assert fade_in
-    assert fade_out
-    assert abs(fade_in[0][0] - 0.35) < 0.02  # starts one fade length before
-    assert fade_in[0][1] == 8  # ramp starts from the rest value
-    fade_in_values = [value for _time, value in fade_in]
-    assert fade_in_values == sorted(fade_in_values)  # linear increase before start
-    assert fade_out[-1][1] == 8  # ramp ends at the rest value
-    fade_out_values = [value for _time, value in fade_out]
-    assert fade_out_values == sorted(fade_out_values, reverse=True)  # linear decrease
-    # Intra-phrase transients are NOT flattened by a step limit.
+    # The inactive gap contains no events other than the boundary copies.
+    assert [event for event in events if 1.55 < event[0] < 2.45] == []
+    # The first phrase's last value is still held right after its end.
+    first_phrase_last = _value_at_or_before(events, 1.5)
+    assert first_phrase_last is not None
+    assert _value_at_or_before(events, 1.6) == first_phrase_last
+    # The second phrase's first value is pre-rolled just before its start, so
+    # the value change happens during the silent gap, not at the note onset.
+    pre_roll = [event for event in events if 2.45 < event[0] < 2.5]
+    assert pre_roll
+    assert pre_roll[0][1] != first_phrase_last  # changed during the silent gap
+    assert pre_roll[0][1] > first_phrase_last  # phrase2 (20 dB) > phrase1 tail (10 dB)
+    # Intra-phrase transients are NOT flattened.
     values = [event[1] for event in events]
     assert max(abs(b - a) for a, b in zip(values, values[1:])) > 8
 

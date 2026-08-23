@@ -545,7 +545,6 @@ def run_stem_separated_transcription(
     expression_interval_seconds: float = 0.02,
     expression_smoothing_seconds: float = 0.1,
     expression_dynamic_stretch: float = 1.0,
-    expression_fade_seconds: float = 0.15,
 ) -> dict[str, object]:
     """ステム分離 -> 各ステム採譜 -> 楽器再ラベリング -> MIDI マージ -> Velocity予測 -> Beat/Chord予測 -> Expression(CC11)を一括実行する。
 
@@ -869,7 +868,6 @@ def run_stem_separated_transcription(
                 interval_seconds=expression_interval_seconds,
                 smoothing_seconds=expression_smoothing_seconds,
                 dynamic_stretch=expression_dynamic_stretch,
-                fade_seconds=expression_fade_seconds,
             )
             merged_midi_path = expression_midi_path
             print("Updated merged MIDI with per-instrument expression (CC11):", merged_midi_path)
