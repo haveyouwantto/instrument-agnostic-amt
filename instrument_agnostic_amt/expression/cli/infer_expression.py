@@ -1,16 +1,18 @@
 """Experimental per-stem expression (CC11) estimation.
 
-For each stem, the *entire* audio is analyzed to estimate a loudness envelope.
-For sustained / orchestral instruments only, the transcribed notes are grouped
-into phrase-like segments and each segment receives a single CC event whose
-value is derived from the loudness envelope of that time interval.
+For each stem, the *entire* audio is analyzed with an STFT (flattop window,
+2048 FFT / 512 hop, the same calculation used by ``velocity_estimator.py``)
+and per-frame magnitudes are converted to dB.  For sustained / orchestral
+instruments only, CC events are written at millisecond resolution (default
+20 ms grid) while the instrument is sounding, following the per-frame dB
+curve mapped with the original STFT range: 0..48 dB -> 8..127 with a
+power-law curve (exponent 1.2), then normalized/stretched per track.
 
 Why this merge strategy:
 - Per-note CC values on the same track fight when notes overlap or when the
-  same tick receives multiple events.  We therefore emit at most one CC event
-  per segment boundary and deduplicate by tick.
-- A step-limited smoothing pass across consecutive segments keeps the curve
-  from jumping between phrases, while still following the audio dynamics.
+  same tick receives multiple events.  We therefore deduplicate by tick
+  (later frame wins) and collapse consecutive equal values, so every track
+  gets a dense, conflict-free expression curve.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from typing import Iterable, Mapping, Sequence
 import numpy as np
 import pretty_midi
 import soundfile as sf
+from scipy.signal.windows import flattop
 
 
 # Default GM program ranges treated as sustained / orchestral.
@@ -80,137 +83,179 @@ def _list_audio_files(audio_source: Path) -> list[Path]:
     )
 
 
+def _stft_peak_magnitude_db(
+    mono: np.ndarray,
+    sample_rate: int,
+    *,
+    n_fft: int,
+    hop_length: int,
+) -> np.ndarray:
+    """Per-frame peak-bin STFT magnitude in dB (flattop window, raw rfft)."""
+    if mono.size < n_fft:
+        mono = np.pad(mono, (0, n_fft - int(mono.size)))
+    num_frames = 1 + (int(mono.size) - n_fft) // hop_length
+    window = flattop(n_fft).astype(np.float64)
+    db_values = np.empty(num_frames, dtype=np.float64)
+    for frame_idx in range(num_frames):
+        start = frame_idx * hop_length
+        spectrum = np.abs(np.fft.rfft(mono[start : start + n_fft] * window))
+        peak_magnitude = float(np.max(spectrum))
+        db_values[frame_idx] = 20.0 * np.log10(max(peak_magnitude, 1e-10))
+    return db_values
+
+
 def estimate_loudness_curve(
     audio_path: Path | str,
     *,
-    frame_seconds: float = 0.1,
-    hop_seconds: float = 0.05,
-    smoothing_seconds: float = 0.3,
-    db_floor_percentile: float = 10.0,
-    db_ceiling_percentile: float = 90.0,
-    cc_min: int = 32,
-    cc_max: int = 120,
+    n_fft: int = 2048,
+    hop_length: int = 512,
+    smoothing_seconds: float = 0.1,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Estimate a CC-style loudness envelope over the whole audio.
-
-    Returns (times_seconds, cc_values) sampled on the hop grid.  The mapping
-    is normalized against robust (percentile) loudness bounds of the whole
-    stem so that the curve captures *relative* dynamics.
-    """
+    """Estimate the whole-stem STFT loudness envelope in dB."""
     waveform, source_sr = sf.read(
         str(audio_path), dtype="float32", always_2d=True
     )
     if waveform.shape[1] > 2:
         waveform = waveform[:, :2]
     mono = waveform.mean(axis=1).astype(np.float64)
-
-    frame = max(1, int(round(float(frame_seconds) * float(source_sr))))
-    hop = max(1, int(round(float(hop_seconds) * float(source_sr))))
-    sample_count = int(mono.shape[0])
-    if sample_count <= frame:
-        window_starts = np.array([0], dtype=np.int64)
-    else:
-        window_starts = np.arange(0, sample_count - frame + 1, hop, dtype=np.int64)
-
-    squared = mono * mono
-    cumulative = np.concatenate(([0.0], np.cumsum(squared)))
-    window_ends = window_starts + frame
-    rms = np.sqrt(
-        np.maximum(
-            (cumulative[window_ends] - cumulative[window_starts]) / float(frame),
-            1e-12,
-        )
+    db_values = _stft_peak_magnitude_db(
+        mono,
+        int(source_sr),
+        n_fft=int(n_fft),
+        hop_length=int(hop_length),
     )
-    db = 20.0 * np.log10(rms + 1e-12)
-
-    kernel = max(1, int(round(float(smoothing_seconds) / max(float(hop_seconds), 1e-6))))
-    if len(db) >= kernel:
-        padded = np.pad(db, (kernel // 2, kernel - 1 - kernel // 2), mode="edge")
+    kernel = max(
+        1,
+        int(round(float(smoothing_seconds) * int(source_sr) / float(hop_length))),
+    )
+    if db_values.shape[0] >= kernel:
+        padded = np.pad(db_values, (kernel // 2, kernel - 1 - kernel // 2), mode="edge")
         kernel_array = np.ones(kernel, dtype=np.float64) / float(kernel)
-        db = np.convolve(padded, kernel_array, mode="valid")
-
-    if len(db) == 0:
-        return np.array([0.0]), np.array([int(cc_min)], dtype=np.int64)
-
-    floor = float(np.percentile(db, db_floor_percentile))
-    ceiling = float(np.percentile(db, db_ceiling_percentile))
-    span = max(ceiling - floor, 3.0)
-    cc_values = np.clip(
-        np.round(
-            (db - floor) / span * float(cc_max - cc_min) + float(cc_min)
-        ),
-        cc_min,
-        cc_max,
-    ).astype(np.int64)
-    times = window_starts.astype(np.float64) / float(source_sr)
-    return times, cc_values
+        db_values = np.convolve(padded, kernel_array, mode="valid")
+    times = np.arange(int(db_values.shape[0]), dtype=np.float64) * float(hop_length) / float(source_sr)
+    return times, db_values
 
 
-def segment_notes(
-    notes: Sequence[pretty_midi.Note],
+def _db_to_cc(
+    db_value: float,
     *,
-    gap_seconds: float = 0.35,
-) -> list[tuple[float, float]]:
-    """Group notes into phrase segments by merging near/overlapping onsets.
-
-    Notes whose onsets are separated by more than ``gap_seconds`` (with no
-    overlap) start a new segment.  Returns a list of (start, end) intervals.
-    """
-    if not notes:
-        return []
-    events = sorted((float(note.start), float(note.end)) for note in notes)
-    segments: list[tuple[float, float]] = []
-    segment_start, segment_end = events[0]
-    for start, end in events[1:]:
-        if start <= segment_end + gap_seconds:
-            segment_end = max(segment_end, end)
-        else:
-            segments.append((segment_start, segment_end))
-            segment_start, segment_end = start, end
-    segments.append((segment_start, segment_end))
-    return segments
+    min_db: float = 0.0,
+    max_db: float = 48.0,
+    cc_min: int = 8,
+    cc_max: int = 127,
+    curve_exponent: float = 1.2,
+) -> int:
+    """Map STFT-magnitude dB to CC with the original velocity-estimator curve."""
+    clamped = np.clip(float(db_value), float(min_db), float(max_db))
+    normalized = (clamped - float(min_db)) / (float(max_db) - float(min_db))
+    curved = normalized ** float(curve_exponent)
+    cc_value = int(round(float(cc_min) + curved * float(cc_max - cc_min)))
+    return max(int(cc_min), min(int(cc_max), cc_value))
 
 
-def merge_segment_cc(
-    segments: Sequence[tuple[float, float]],
-    curve_times: np.ndarray,
-    curve_values: np.ndarray,
+def _stretch_cc_values(
+    values: Sequence[int],
     *,
     cc_min: int,
     cc_max: int,
-    max_step: int,
-) -> list[tuple[float, int]]:
-    """Merge per-segment targets into a smooth, conflict-free CC event list.
-
-    The target of each segment is the mean loudness CC over that interval.
-    Consecutive segments are constrained by ``max_step`` so the curve cannot
-    jump abruptly.  At most one event is produced per segment boundary.
-    """
-    if not segments:
+    dynamic_stretch: float,
+) -> list[int]:
+    """Normalize the peak to ``cc_max`` and stretch dynamics below it."""
+    if not values:
         return []
-    targets: list[float] = []
-    for start, end in segments:
-        mask = (curve_times >= start) & (curve_times <= end)
-        if mask.any():
-            targets.append(float(np.mean(curve_values[mask])))
-        else:
-            index = int(np.searchsorted(curve_times, start, side="right")) - 1
-            index = max(0, min(index, int(curve_values.shape[0]) - 1))
-            targets.append(float(curve_values[index]))
+    peak = max(values)
+    if peak <= 0:
+        return [int(cc_min)] * len(values)
+    stretched: list[int] = []
+    for value in values:
+        normalized = float(np.clip(float(value) * float(cc_max) / float(peak), cc_min, cc_max))
+        if dynamic_stretch > 1.0:
+            normalized = float(cc_max) - (
+                float(cc_max) - normalized
+            ) * float(dynamic_stretch)
+        stretched.append(
+            int(round(float(np.clip(normalized, cc_min, cc_max))))
+        )
+    return stretched
+
+
+def build_frame_cc_events(
+    midi: pretty_midi.PrettyMIDI,
+    curve_times: np.ndarray,
+    curve_values: np.ndarray,
+    notes: Sequence[pretty_midi.Note],
+    *,
+    cc: int = 11,
+    interval_seconds: float = 0.02,
+    cc_min: int,
+    cc_max: int,
+    dynamic_stretch: float = 1.0,
+    min_db: float = 0.0,
+    max_db: float = 48.0,
+    curve_exponent: float = 1.2,
+) -> list[tuple[float, int]]:
+    """Build a dense, millisecond-resolution CC event list for one track.
+
+    Every curve frame inside the track's note span (first note start .. last
+    note end) is mapped to a CC value via the 0..48 dB -> 8..127 power-law
+    curve, then normalized/stretched per track.  Events are written on a
+    ``interval_seconds`` grid (default 20 ms), deduplicated by tick (later
+    frame wins) and consecutive equal values are collapsed, so the track gets
+    a continuously-moving expression curve without same-tick conflicts.
+    """
+    if not notes:
+        return []
+    note_start = min(float(note.start) for note in notes)
+    note_end = max(float(note.end) for note in notes)
+    mask = (curve_times >= note_start) & (curve_times <= note_end)
+    frame_times = curve_times[mask]
+    frame_db = curve_values[mask]
+    if frame_times.shape[0] == 0:
+        return []
+
+    frame_cc = [
+        _db_to_cc(
+            float(db),
+            min_db=min_db,
+            max_db=max_db,
+            cc_min=cc_min,
+            cc_max=cc_max,
+            curve_exponent=curve_exponent,
+        )
+        for db in frame_db
+    ]
+    frame_cc = _stretch_cc_values(
+        frame_cc,
+        cc_min=cc_min,
+        cc_max=cc_max,
+        dynamic_stretch=dynamic_stretch,
+    )
+
+    # Re-sample onto the requested millisecond grid, dedupe by tick (later
+    # frame wins), then collapse consecutive equal values.
+    frame_dt = (
+        float(curve_times[1] - curve_times[0])
+        if curve_times.shape[0] > 1
+        else 0.0
+    )
+    step = (
+        max(1, int(round(float(interval_seconds) / frame_dt)))
+        if frame_dt > 0
+        else 1
+    )
+    by_tick: dict[int, int] = {}
+    for frame_index in range(0, int(frame_times.shape[0]), step):
+        tick = int(midi.time_to_tick(float(frame_times[frame_index])))
+        by_tick[tick] = int(frame_cc[frame_index])
 
     events: list[tuple[float, int]] = []
-    previous: float | None = None
-    for (start, _end), target in zip(segments, targets):
-        if previous is None:
-            value = float(np.clip(target, cc_min, cc_max))
-        else:
-            value = float(
-                np.clip(previous + (target - previous), previous - max_step, previous + max_step)
-            )
-        cc_value = int(round(value))
-        cc_value = max(cc_min, min(cc_max, cc_value))
-        events.append((start, cc_value))
-        previous = float(cc_value)
+    last_value: int | None = None
+    for tick in sorted(by_tick):
+        value = by_tick[tick]
+        if value == last_value:
+            continue
+        events.append((float(midi.tick_to_time(tick)), value))
+        last_value = value
     return events
 
 
@@ -231,10 +276,13 @@ def apply_expression_to_midi(
     *,
     cc: int = 11,
     sustained_ranges: Sequence[tuple[int, int]] = SUSTAINED_PROGRAM_RANGES,
-    gap_seconds: float = 0.35,
-    cc_min: int = 32,
-    cc_max: int = 120,
-    max_step: int = 12,
+    interval_seconds: float = 0.02,
+    cc_min: int = 8,
+    cc_max: int = 127,
+    dynamic_stretch: float = 1.0,
+    min_db: float = 0.0,
+    max_db: float = 48.0,
+    curve_exponent: float = 1.2,
 ) -> int:
     """Write CC events onto sustained instruments of ``midi`` in place.
 
@@ -244,43 +292,183 @@ def apply_expression_to_midi(
     """
     changed_instruments = 0
     for instrument in midi.instruments:
-        if not _is_sustained(int(instrument.program), bool(instrument.is_drum), sustained_ranges):
-            continue
-        if not instrument.notes:
-            continue
-
-        instrument.control_changes = [
-            control
-            for control in instrument.control_changes
-            if int(control.number) != int(cc)
-        ]
-        segments = segment_notes(instrument.notes, gap_seconds=gap_seconds)
-        if not segments:
-            continue
-        events = merge_segment_cc(
-            segments,
+        if _apply_expression_to_instrument(
+            instrument,
             curve_times,
             curve_values,
+            cc=cc,
+            sustained_ranges=sustained_ranges,
+            interval_seconds=interval_seconds,
             cc_min=cc_min,
             cc_max=cc_max,
-            max_step=max_step,
-        )
-
-        # Emit a state-defining event at time 0, then one per segment boundary.
-        by_tick: dict[int, int] = {0: events[0][1]}
-        for start, value in events:
-            by_tick[int(midi.time_to_tick(start))] = value
-        for tick in sorted(by_tick):
-            instrument.control_changes.append(
-                pretty_midi.ControlChange(
-                    number=int(cc),
-                    value=int(by_tick[tick]),
-                    time=float(midi.tick_to_time(tick)),
-                )
-            )
-        instrument.control_changes.sort(key=lambda control: control.time)
-        changed_instruments += 1
+            dynamic_stretch=dynamic_stretch,
+            min_db=min_db,
+            max_db=max_db,
+            curve_exponent=curve_exponent,
+            midi=midi,
+        ):
+            changed_instruments += 1
     return changed_instruments
+
+
+def _apply_expression_to_instrument(
+    instrument: pretty_midi.Instrument,
+    curve_times: np.ndarray,
+    curve_values: np.ndarray,
+    *,
+    cc: int,
+    sustained_ranges: Sequence[tuple[int, int]],
+    interval_seconds: float,
+    cc_min: int,
+    cc_max: int,
+    dynamic_stretch: float,
+    min_db: float,
+    max_db: float,
+    curve_exponent: float,
+    midi: pretty_midi.PrettyMIDI,
+) -> bool:
+    """Write CC events onto one sustained instrument using the given curve."""
+    if not _is_sustained(int(instrument.program), bool(instrument.is_drum), sustained_ranges):
+        return False
+    if not instrument.notes:
+        return False
+    instrument.control_changes = [
+        control
+        for control in instrument.control_changes
+        if int(control.number) != int(cc)
+    ]
+    events = build_frame_cc_events(
+        midi,
+        curve_times,
+        curve_values,
+        instrument.notes,
+        cc=cc,
+        interval_seconds=interval_seconds,
+        cc_min=cc_min,
+        cc_max=cc_max,
+        dynamic_stretch=dynamic_stretch,
+        min_db=min_db,
+        max_db=max_db,
+        curve_exponent=curve_exponent,
+    )
+    if not events:
+        return False
+    for start, value in events:
+        instrument.control_changes.append(
+            pretty_midi.ControlChange(
+                number=int(cc),
+                value=int(value),
+                time=float(start),
+            )
+        )
+    instrument.control_changes.sort(key=lambda control: control.time)
+    return True
+
+
+def apply_expression_to_merged_midi(
+    merged_midi_path: Path | str,
+    stem_midis: Mapping[str, Path | str] | Sequence[Path | str],
+    stem_audios: Mapping[str, Path | str] | Path | str,
+    *,
+    output_midi_path: Path | str | None = None,
+    cc: int = 11,
+    sustained_ranges: Sequence[tuple[int, int]] = SUSTAINED_PROGRAM_RANGES,
+    n_fft: int = 2048,
+    hop_length: int = 512,
+    interval_seconds: float = 0.02,
+    cc_min: int = 8,
+    cc_max: int = 127,
+    dynamic_stretch: float = 1.0,
+    min_db: float = 0.0,
+    max_db: float = 48.0,
+    curve_exponent: float = 1.2,
+) -> Path:
+    """Write CC expression curves onto the merged MIDI, keeping its tempo map.
+
+    Each sustained instrument of the merged file is mapped back to the stem
+    that produced it (by program / drum flag / instrument name) and uses that
+    stem's full-audio loudness curve.
+    """
+    merged_path = Path(merged_midi_path)
+    midi_obj = pretty_midi.PrettyMIDI(str(merged_path))
+
+    if isinstance(stem_midis, Mapping):
+        stem_midi_items = list(stem_midis.items())
+    else:
+        stem_midi_items = [(Path(path).stem, Path(path)) for path in stem_midis]
+
+    audio_by_name: dict[str, Path] = {}
+    if isinstance(stem_audios, Mapping):
+        for name, path in stem_audios.items():
+            audio_by_name[str(name).lower()] = Path(path)
+    else:
+        audio_files = _list_audio_files(Path(stem_audios))
+        for name, path in stem_midi_items:
+            audio_by_name[str(name).lower()] = _resolve_audio_paths(
+                Path(path), str(name), audio_files
+            )
+
+    stem_instrument_keys: dict[str, set[tuple[int, bool, str]]] = {}
+    for stem_name, midi_path in stem_midi_items:
+        stem_midi = Path(midi_path)
+        if not stem_midi.exists():
+            continue
+        pm_obj = pretty_midi.PrettyMIDI(str(stem_midi))
+        stem_instrument_keys[stem_name] = {
+            (int(inst.program), bool(inst.is_drum), str(inst.name))
+            for inst in pm_obj.instruments
+        }
+
+    curve_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    changed = 0
+    for instrument in midi_obj.instruments:
+        key = (int(instrument.program), bool(instrument.is_drum), str(instrument.name))
+        stem_name = next(
+            (
+                name
+                for name, keys in stem_instrument_keys.items()
+                if key in keys
+            ),
+            None,
+        )
+        if stem_name is None:
+            continue
+        audio_path = audio_by_name.get(str(stem_name).lower())
+        if audio_path is None or not audio_path.exists():
+            print(
+                f"[Expression] WARNING: no audio for stem {stem_name}, "
+                f"skipping {instrument.name}"
+            )
+            continue
+        if stem_name not in curve_cache:
+            curve_cache[stem_name] = estimate_loudness_curve(
+                audio_path,
+                n_fft=n_fft,
+                hop_length=hop_length,
+            )
+        curve_times, curve_values = curve_cache[stem_name]
+        if _apply_expression_to_instrument(
+            instrument,
+            curve_times,
+            curve_values,
+            cc=cc,
+            sustained_ranges=sustained_ranges,
+            interval_seconds=interval_seconds,
+            cc_min=cc_min,
+            cc_max=cc_max,
+            dynamic_stretch=dynamic_stretch,
+            min_db=min_db,
+            max_db=max_db,
+            curve_exponent=curve_exponent,
+            midi=midi_obj,
+        ):
+            changed += 1
+
+    output_path = Path(output_midi_path) if output_midi_path is not None else merged_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    midi_obj.write(str(output_path))
+    print(f"[Expression] {changed} sustained instrument(s) on merged MIDI received CC{cc}")
+    return output_path
 
 
 def predict_expression_for_stem_midis(
@@ -291,13 +479,15 @@ def predict_expression_for_stem_midis(
     in_place: bool = False,
     cc: int = 11,
     sustained_ranges: Sequence[tuple[int, int]] = SUSTAINED_PROGRAM_RANGES,
-    gap_seconds: float = 0.35,
-    frame_seconds: float = 0.1,
-    hop_seconds: float = 0.05,
-    smoothing_seconds: float = 0.3,
-    cc_min: int = 32,
-    cc_max: int = 120,
-    max_step: int = 12,
+    n_fft: int = 2048,
+    hop_length: int = 512,
+    interval_seconds: float = 0.02,
+    cc_min: int = 8,
+    cc_max: int = 127,
+    dynamic_stretch: float = 1.0,
+    min_db: float = 0.0,
+    max_db: float = 48.0,
+    curve_exponent: float = 1.2,
     quiet: bool = False,
 ) -> dict[str, Path]:
     """Apply CC expression curves to each stem MIDI using its full audio.
@@ -335,11 +525,8 @@ def predict_expression_for_stem_midis(
 
         curve_times, curve_values = estimate_loudness_curve(
             audio_path,
-            frame_seconds=frame_seconds,
-            hop_seconds=hop_seconds,
-            smoothing_seconds=smoothing_seconds,
-            cc_min=cc_min,
-            cc_max=cc_max,
+            n_fft=n_fft,
+            hop_length=hop_length,
         )
         midi_obj = pretty_midi.PrettyMIDI(str(midi_path))
         changed = apply_expression_to_midi(
@@ -348,10 +535,13 @@ def predict_expression_for_stem_midis(
             curve_values,
             cc=cc,
             sustained_ranges=sustained_ranges,
-            gap_seconds=gap_seconds,
+            interval_seconds=interval_seconds,
             cc_min=cc_min,
             cc_max=cc_max,
-            max_step=max_step,
+            dynamic_stretch=dynamic_stretch,
+            min_db=min_db,
+            max_db=max_db,
+            curve_exponent=curve_exponent,
         )
         if in_place:
             output_path = midi_path
@@ -423,22 +613,29 @@ def parse_args() -> argparse.Namespace:
         help="Where to write *_expression.mid files (default: alongside inputs).",
     )
     parser.add_argument("--cc", type=int, default=11, help="Controller number (default: 11).")
+    parser.add_argument("--n-fft", type=int, default=2048, help="STFT window size (samples).")
+    parser.add_argument("--hop-length", type=int, default=512, help="STFT hop length (samples).")
     parser.add_argument(
-        "--gap-seconds",
+        "--cc-interval-ms",
         type=float,
-        default=0.35,
-        help="Max note gap (s) within one phrase segment.",
+        default=20.0,
+        help="CC event grid interval in milliseconds (default 20 ms).",
     )
-    parser.add_argument("--frame-seconds", type=float, default=0.1, help="Loudness frame (s).")
-    parser.add_argument("--hop-seconds", type=float, default=0.05, help="Loudness hop (s).")
-    parser.add_argument("--smoothing-seconds", type=float, default=0.3, help="Curve smoothing (s).")
-    parser.add_argument("--cc-min", type=int, default=32, help="Minimum CC value.")
-    parser.add_argument("--cc-max", type=int, default=120, help="Maximum CC value.")
+    parser.add_argument("--min-db", type=float, default=0.0, help="Minimum dB for the CC mapping.")
+    parser.add_argument("--max-db", type=float, default=48.0, help="Maximum dB for the CC mapping.")
     parser.add_argument(
-        "--max-step",
-        type=int,
-        default=12,
-        help="Maximum CC change between consecutive segments.",
+        "--curve-exponent",
+        type=float,
+        default=1.2,
+        help="Power-law curve exponent for dB -> CC.",
+    )
+    parser.add_argument("--cc-min", type=int, default=8, help="Minimum CC value.")
+    parser.add_argument("--cc-max", type=int, default=127, help="Maximum CC value.")
+    parser.add_argument(
+        "--dynamic-stretch",
+        type=float,
+        default=1.0,
+        help="Normalize each track's peak to CC max and stretch its dynamics by this factor.",
     )
     parser.add_argument(
         "--merge",
@@ -461,13 +658,15 @@ def main() -> None:
         stem_audios=audio_dir,
         output_dir=output_dir,
         cc=args.cc,
-        gap_seconds=args.gap_seconds,
-        frame_seconds=args.frame_seconds,
-        hop_seconds=args.hop_seconds,
-        smoothing_seconds=args.smoothing_seconds,
+        n_fft=args.n_fft,
+        hop_length=args.hop_length,
+        interval_seconds=args.cc_interval_ms / 1000.0,
         cc_min=args.cc_min,
         cc_max=args.cc_max,
-        max_step=args.max_step,
+        dynamic_stretch=args.dynamic_stretch,
+        min_db=args.min_db,
+        max_db=args.max_db,
+        curve_exponent=args.curve_exponent,
     )
     if not outputs:
         raise SystemExit("No expression MIDI files were produced.")
