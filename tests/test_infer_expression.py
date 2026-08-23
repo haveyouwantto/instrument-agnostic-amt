@@ -90,6 +90,10 @@ def test_expression_cc_follows_loudness(tmp_path) -> None:
     assert all(a < b for a, b in zip(times, times[1:]))
     median_interval = float(np.median(np.diff(times)))
     assert median_interval <= 0.05  # millisecond-level resolution
+    values = [event.value for event in violin_events]
+    assert max(
+        abs(b - a) for a, b in zip(values, values[1:])
+    ) <= 8  # step-limited, no instant jumps
 
     violin_first = [event.value for event in violin_events if event.time < 2.0]
     violin_second = [event.value for event in violin_events if event.time >= 2.0]
@@ -121,6 +125,35 @@ def test_frame_events_are_millisecond_resolution() -> None:
     assert len(events) >= 100  # ~1 event per 20 ms over 4 s
     times = [event[0] for event in events]
     assert all(a < b for a, b in zip(times, times[1:]))
+
+
+def test_frame_events_are_step_limited() -> None:
+    midi = pretty_midi.PrettyMIDI(resolution=480)
+    notes = [pretty_midi.Note(velocity=90, pitch=67, start=0.0, end=4.0)]
+    curve_times = np.arange(0.0, 4.0, 0.02)
+    # quiet dB first (CC ~22 after normalization), then loud (normalized peak).
+    curve_values = np.concatenate(
+        [
+            np.full(100, 6.0),
+            np.full(int(curve_times.shape[0]) - 100, 40.0),
+        ]
+    )
+    events = build_frame_cc_events(
+        midi,
+        curve_times,
+        curve_values,
+        notes,
+        interval_seconds=0.02,
+        cc_min=8,
+        cc_max=127,
+        max_step=8,
+    )
+    assert events
+    values = [event[1] for event in events]
+    # The very first event ramps down from the MIDI CC default (127).
+    assert values[0] == 119
+    assert max(abs(b - a) for a, b in zip(values, values[1:])) <= 8
+    assert values[-1] == 127  # the loud section reaches the normalized peak
 
 
 def test_apply_expression_replaces_existing_cc(tmp_path) -> None:

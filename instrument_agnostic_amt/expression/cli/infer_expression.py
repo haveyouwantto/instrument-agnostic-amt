@@ -346,6 +346,7 @@ def build_frame_cc_events(
     cc_min: int,
     cc_max: int,
     dynamic_stretch: float = 1.0,
+    max_step: int = 8,
     min_db: float = 0.0,
     max_db: float = 48.0,
     curve_exponent: float = 1.2,
@@ -404,14 +405,25 @@ def build_frame_cc_events(
         tick = int(midi.time_to_tick(float(frame_times[frame_index])))
         by_tick[tick] = int(frame_cc[frame_index])
 
-    events: list[tuple[float, int]] = []
-    last_value: int | None = None
+    raw_events: list[tuple[float, int]] = []
+    previous: int = int(cc_max)  # MIDI CC default is full value (127)
     for tick in sorted(by_tick):
-        value = by_tick[tick]
-        if value == last_value:
+        target = by_tick[tick]
+        value = int(
+            np.clip(
+                float(target),
+                previous - int(max_step),
+                previous + int(max_step),
+            )
+        )
+        raw_events.append((float(midi.tick_to_time(tick)), value))
+        previous = value
+    # Collapse consecutive equal values after the step-limited smoothing.
+    events: list[tuple[float, int]] = []
+    for time_value, value in raw_events:
+        if events and events[-1][1] == value:
             continue
-        events.append((float(midi.tick_to_time(tick)), value))
-        last_value = value
+        events.append((time_value, value))
     return events
 
 
@@ -436,6 +448,7 @@ def apply_expression_to_midi(
     cc_min: int = 8,
     cc_max: int = 127,
     dynamic_stretch: float = 1.0,
+    max_step: int = 8,
     smoothing_seconds: float = 0.1,
     min_db: float = 0.0,
     max_db: float = 48.0,
@@ -459,6 +472,7 @@ def apply_expression_to_midi(
             cc_min=cc_min,
             cc_max=cc_max,
             dynamic_stretch=dynamic_stretch,
+            max_step=max_step,
             min_db=min_db,
             max_db=max_db,
             curve_exponent=curve_exponent,
@@ -479,6 +493,7 @@ def _apply_expression_to_instrument(
     cc_min: int,
     cc_max: int,
     dynamic_stretch: float,
+    max_step: int,
     min_db: float,
     max_db: float,
     curve_exponent: float,
@@ -504,6 +519,7 @@ def _apply_expression_to_instrument(
         cc_min=cc_min,
         cc_max=cc_max,
         dynamic_stretch=dynamic_stretch,
+        max_step=max_step,
         min_db=min_db,
         max_db=max_db,
         curve_exponent=curve_exponent,
@@ -536,6 +552,7 @@ def apply_expression_to_merged_midi(
     cc_min: int = 8,
     cc_max: int = 127,
     dynamic_stretch: float = 1.0,
+    max_step: int = 8,
     smoothing_seconds: float = 0.1,
     min_db: float = 0.0,
     max_db: float = 48.0,
@@ -626,6 +643,7 @@ def apply_expression_to_merged_midi(
             cc_min=cc_min,
             cc_max=cc_max,
             dynamic_stretch=dynamic_stretch,
+            max_step=max_step,
             min_db=min_db,
             max_db=max_db,
             curve_exponent=curve_exponent,
@@ -654,6 +672,7 @@ def predict_expression_for_stem_midis(
     cc_min: int = 8,
     cc_max: int = 127,
     dynamic_stretch: float = 1.0,
+    max_step: int = 8,
     smoothing_seconds: float = 0.1,
     min_db: float = 0.0,
     max_db: float = 48.0,
@@ -731,6 +750,7 @@ def predict_expression_for_stem_midis(
                 cc_min=cc_min,
                 cc_max=cc_max,
                 dynamic_stretch=dynamic_stretch,
+                max_step=max_step,
                 min_db=min_db,
                 max_db=max_db,
                 curve_exponent=curve_exponent,
@@ -838,6 +858,12 @@ def parse_args() -> argparse.Namespace:
         help="Normalize each track's peak to CC max and stretch its dynamics by this factor.",
     )
     parser.add_argument(
+        "--max-step",
+        type=int,
+        default=8,
+        help="Maximum CC change between consecutive events (smooths phrase edges).",
+    )
+    parser.add_argument(
         "--merge",
         action="store_true",
         help="Also merge the expression MIDIs into one file.",
@@ -865,6 +891,7 @@ def main() -> None:
         cc_min=args.cc_min,
         cc_max=args.cc_max,
         dynamic_stretch=args.dynamic_stretch,
+        max_step=args.max_step,
         min_db=args.min_db,
         max_db=args.max_db,
         curve_exponent=args.curve_exponent,
