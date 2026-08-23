@@ -540,7 +540,7 @@ def run_stem_separated_transcription(
     amp_dtype: str | None = None,
     compile_model: bool = False,
     compile_mode: str = "default",
-    predict_expression: bool = False,
+    predict_expression: bool = True,
     expression_cc: int = 11,
     expression_interval_seconds: float = 0.02,
     expression_smoothing_seconds: float = 0.1,
