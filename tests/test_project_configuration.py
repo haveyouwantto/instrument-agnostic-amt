@@ -70,6 +70,7 @@ def test_project_groups_dependencies_by_workflow() -> None:
             "faster-whisper",
             "librosa",
             "moduleconf",
+            "setuptools<81",
             "stem-splitter",
             "transkun",
             "ADTOF-pytorch @ git+https://github.com/xavriley/ADTOF-pytorch.git",

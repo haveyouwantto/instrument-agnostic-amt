@@ -26,6 +26,7 @@ stem = [
     "faster-whisper",
     "librosa",
     "moduleconf",
+    "setuptools<81",
     "stem-splitter",
     "transkun",
     "ADTOF-pytorch @ git+https://github.com/xavriley/ADTOF-pytorch.git",
