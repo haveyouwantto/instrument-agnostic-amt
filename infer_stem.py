@@ -268,12 +268,17 @@ def get_stem_pipeline_models(
     stem_splitter_batch_size: int = 1,
     compile_model: bool = False,
     compile_mode: str = "default",
+    semi_crf_backend: str = "torch",
 ) -> dict[str, object]:
     """AMT とステム分離モデルを読み込み、セッション中は再利用する。"""
     if stem_splitter_batch_size < 1:
         raise ValueError("stem_splitter_batch_size must be at least 1")
+    if semi_crf_backend not in {"torch", "triton"}:
+        raise ValueError("semi_crf_backend must be one of {'torch', 'triton'}")
 
     compute_device = resolve_device(device_preference)
+    if semi_crf_backend == "triton" and compute_device.type != "cuda":
+        raise ValueError("semi_crf_backend='triton' requires a CUDA device")
 
     # 低显存模式：模型常驻 CPU 内存（RAM），仅在推理时搬运到 compute_device。
     storage_device = torch.device("cpu") if low_vram_mode else compute_device
@@ -289,6 +294,7 @@ def get_stem_pipeline_models(
         "amt",
         str(resolved_checkpoint.resolve()),
         str(storage_device),
+        ("semi-crf", semi_crf_backend),
         *compile_cache_key,
     )
     if low_vram_mode:
@@ -344,6 +350,7 @@ def get_stem_pipeline_models(
             window_ms_override=None,
             stride_ms_override=None,
             track_batch_size_override=None,
+            semi_crf_backend=semi_crf_backend,
         )
         amt_forward = maybe_compile_forward(
             amt_model,
@@ -591,6 +598,7 @@ def run_stem_separated_transcription(
     compile_model: bool = False,
     compile_velocity: bool = False,
     compile_mode: str = "default",
+    semi_crf_backend: str = "torch",
 ) -> dict[str, object]:
     """ステム分離 -> 各ステム採譜 -> 楽器再ラベリング -> MIDI マージ -> Velocity予測 -> Beat/Chord予測を一括実行する。
 
@@ -611,6 +619,7 @@ def run_stem_separated_transcription(
         stem_splitter_batch_size=stem_splitter_batch_size,
         compile_model=compile_model,
         compile_mode=compile_mode,
+        semi_crf_backend=semi_crf_backend,
     )
     device = bundle["device"]
     amt_amp_enabled = bool(amp and is_amp_supported(device))
@@ -655,6 +664,7 @@ def run_stem_separated_transcription(
                 stem_splitter_batch_size=stem_splitter_batch_size,
                 compile_model=compile_model,
                 compile_mode=compile_mode,
+                semi_crf_backend=semi_crf_backend,
             )
         return amt_bundles[model_type_key]
 
