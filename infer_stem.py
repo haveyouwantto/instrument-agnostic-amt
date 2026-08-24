@@ -577,6 +577,9 @@ def run_stem_separated_transcription(
     window_batch_size: int = 4,
     max_midi_melodic_instruments: int = 15,
     transcribe_drum_stems: bool = True,
+    use_adtof_transcriber: bool = False,
+    use_stft_vocalizer: bool = False,
+    use_transkun: bool = False,
     cleanup_separated_stems: bool = False,
     refine_instruments: bool = True,
     refinement_checkpoint_path: Path | str | None = None,
@@ -723,6 +726,29 @@ def run_stem_separated_transcription(
             continue
 
         output_midi = stem_midi_dir / f"{audio_file.stem}_{stem_name}.mid"
+
+        if "drum" in stem_name.lower() and use_adtof_transcriber:
+            print(f"Transcribing drum stem with ADTOF transcriber: {stem_name}")
+            from adtof_pytorch import transcribe_to_midi
+
+            transcribe_to_midi(stem_path, output_midi)
+            stem_midi_paths[stem_name] = output_midi
+            continue
+        if "vocal" in stem_name.lower() and use_stft_vocalizer:
+            print(f"Transcribing vocal stem with STFT transcriber: {stem_name}")
+            from stft_transcriber import wav_to_midi
+
+            wav_to_midi(stem_path, output_midi)
+            stem_midi_paths[stem_name] = output_midi
+            continue
+        if "piano" in stem_name.lower() and use_transkun:
+            print(f"Transcribing piano stem with TransKun transcriber: {stem_name}")
+            from transkun_helper import transcribe_with_transkun
+
+            transcribe_with_transkun(str(stem_path), str(output_midi))
+            stem_midi_paths[stem_name] = output_midi
+            continue
+
         model_type = resolve_stem_model_type(stem_name)
         current_bundle = get_amt_bundle(model_type)
         current_amt_model = current_bundle["amt_model"]
