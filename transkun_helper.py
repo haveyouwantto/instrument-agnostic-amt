@@ -40,8 +40,6 @@ def readAudio(path, normalize=True):
     return samplerate, data
 
 def transcribe_with_transkun(input_path: str, output_midi_path: str):
-    
-    import pkg_resources
 
     defaultWeight =  os.path.join(os.path.dirname(transkun.__file__), "pretrained/2.0.pt")
     defaultConf =  os.path.join(os.path.dirname(transkun.__file__), "pretrained/2.0.conf")
