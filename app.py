@@ -38,7 +38,7 @@ class BaseTranscriber:
         raise NotImplementedError("transcribe() must be implemented")
 
 # ---- 具体实现：TranskunTranscriber ----
-from infer_stem import run_stem_separated_transcription
+from instrument_agnostic_amt.cli.infer_stem import run_stem_separated_transcription
 
 class TranskunTranscriber(BaseTranscriber):
 
