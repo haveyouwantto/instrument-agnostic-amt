@@ -12,8 +12,8 @@ import pytest
 import soundfile as sf
 import torch
 
-import infer_stem
-from infer_stem import (
+from instrument_agnostic_amt.cli import infer_stem
+from instrument_agnostic_amt.cli.infer_stem import (
     get_beat_chord_models,
     get_stem_pipeline_models,
     merge_midis_logic,
@@ -31,7 +31,7 @@ from instrument_agnostic_amt.taxonomy.instrument_classes import (
 
 
 def test_resolve_stem_model_type() -> None:
-    assert resolve_stem_model_type("drums_stem") == "drums"
+    assert resolve_stem_model_type("drums_stem") == "drums_v1_5"
     assert resolve_stem_model_type("bass_stem") == "bass_v2"
     assert resolve_stem_model_type("vocal_stem") == "vocal_harmony_v1_5"
     assert resolve_stem_model_type("guitar_stem") == "guitar_v1_5"
