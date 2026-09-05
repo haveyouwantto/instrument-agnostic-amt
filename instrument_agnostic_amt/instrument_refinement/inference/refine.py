@@ -23,9 +23,14 @@ import pretty_midi
 import torch
 from tqdm.auto import tqdm
 
-from ...inference.audio import load_audio
-from ...inference.instruments import resolve_stem_instrument_class_ids
-from ...runtime import copy_tensors_to_cpu_once, resolve_device
+from ...amt.inference.audio import load_audio
+from ...amt.inference.instruments import resolve_stem_instrument_class_ids
+from ...runtime import (
+    copy_tensors_to_cpu_once,
+    is_amp_supported,
+    resolve_amp_dtype,
+    resolve_device,
+)
 from ...taxonomy.instrument_classes import (
     INSTRUMENT_CLASSES,
     get_instrument_class_id_by_name,
@@ -72,9 +77,7 @@ def _allowed_class_ids(stem_name: str | None, *, use_stem_mask: bool) -> tuple[i
     """
     drum_id = get_instrument_class_id_by_name("drums")
     stem_class_ids = (
-        resolve_stem_instrument_class_ids(inference_stem_group(stem_name))
-        if use_stem_mask and stem_name
-        else None
+        resolve_stem_instrument_class_ids(inference_stem_group(stem_name)) if use_stem_mask and stem_name else None
     )
     candidate_ids = stem_class_ids or tuple(range(len(INSTRUMENT_CLASSES)))
     if stem_class_ids is not None:
@@ -134,6 +137,8 @@ def _scan_windows(
     window_batch_size: int,
     device: torch.device,
     disable_tqdm: bool,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
 ) -> _WindowScan:
     """音声を窓に切ってモデルを流し、窓をまたいで平均する。
 
@@ -145,6 +150,7 @@ def _scan_windows(
     stride_frames = int(round(stride_seconds * config.sample_rate))
     starts = _window_starts(total_frames, window_frames, stride_frames)
 
+    scanned_starts: list[int] = []
     window_logits: list[np.ndarray] = []
     window_embeddings: list[np.ndarray] = []
     window_note_counts: list[int] = []
@@ -156,8 +162,7 @@ def _scan_windows(
         raise ValueError("window_batch_size must be positive")
 
     start_batches = [
-        starts[offset : offset + int(window_batch_size)]
-        for offset in range(0, len(starts), int(window_batch_size))
+        starts[offset : offset + int(window_batch_size)] for offset in range(0, len(starts), int(window_batch_size))
     ]
     for batch_starts in tqdm(
         start_batches,
@@ -181,20 +186,17 @@ def _scan_windows(
                 )
             start_seconds = float(sample_start) / float(config.sample_rate)
             end_seconds = start_seconds + window_seconds
-            active = (notes.start_seconds >= start_seconds) & (
-                notes.start_seconds < end_seconds
-            )
+            active = (notes.start_seconds >= start_seconds) & (notes.start_seconds < end_seconds)
             indices = np.flatnonzero(active)
             windows.append(window)
             valid_frames_batch.append(valid_frames)
             indices_batch.append(indices)
-            relative_starts.append(
-                torch.from_numpy(notes.start_seconds[indices] - start_seconds)
-            )
-            relative_ends.append(
-                torch.from_numpy(notes.end_seconds[indices] - start_seconds)
-            )
+            relative_starts.append(torch.from_numpy(notes.start_seconds[indices] - start_seconds))
+            relative_ends.append(torch.from_numpy(notes.end_seconds[indices] - start_seconds))
             pitches.append(torch.from_numpy(notes.pitch[indices]))
+
+        if not any(len(indices) for indices in indices_batch):
+            continue
 
         note_start_batch = torch.nn.utils.rnn.pad_sequence(
             relative_starts,
@@ -217,36 +219,43 @@ def _scan_windows(
         for batch_index, indices in enumerate(indices_batch):
             note_mask[batch_index, : len(indices)] = True
 
-        outputs = model(
-            torch.stack(windows).to(device),
-            valid_audio_frames=torch.tensor(
-                valid_frames_batch,
-                device=device,
-            ),
-            note_start_seconds=note_start_batch.to(device),
-            note_end_seconds=note_end_batch.to(device),
-            note_pitch=note_pitch_batch.to(device),
-            # AMT が付けた楽器は意図的に渡さない（-1）。音声から判断させるため。
-            note_prior_class=torch.full(
-                (len(batch_starts), max_notes),
-                -1,
-                dtype=torch.long,
-                device=device,
-            ),
-            note_confidence=torch.ones(
-                len(batch_starts),
-                max_notes,
-                device=device,
-            ),
-            note_mask=note_mask.to(device),
-            stem_context_id=torch.full(
-                (len(batch_starts),),
-                context_id,
-                dtype=torch.long,
-                device=device,
-            ),
-            window_seconds=window_seconds,
-        )
+        # backboneのCQT/convとTransformerが窓ごとの支配項なので、AMTと同じ
+        # autocastをかける。集約はこの直後にfloat32へ戻してから行う。
+        with torch.amp.autocast(
+            device_type=device.type,
+            dtype=amp_dtype,
+            enabled=amp_enabled,
+        ):
+            outputs = model(
+                torch.stack(windows).to(device),
+                valid_audio_frames=torch.tensor(
+                    valid_frames_batch,
+                    device=device,
+                ),
+                note_start_seconds=note_start_batch.to(device),
+                note_end_seconds=note_end_batch.to(device),
+                note_pitch=note_pitch_batch.to(device),
+                # AMT が付けた楽器は意図的に渡さない（-1）。音声から判断させるため。
+                note_prior_class=torch.full(
+                    (len(batch_starts), max_notes),
+                    -1,
+                    dtype=torch.long,
+                    device=device,
+                ),
+                note_confidence=torch.ones(
+                    len(batch_starts),
+                    max_notes,
+                    device=device,
+                ),
+                note_mask=note_mask.to(device),
+                stem_context_id=torch.full(
+                    (len(batch_starts),),
+                    context_id,
+                    dtype=torch.long,
+                    device=device,
+                ),
+                window_seconds=window_seconds,
+            )
         (
             window_logits_tensor,
             window_embeddings_tensor,
@@ -266,9 +275,8 @@ def _scan_windows(
         note_logits_batch = note_logits_tensor.numpy()
         note_embeddings_batch = note_embeddings_tensor.numpy()
         for batch_index, indices in enumerate(indices_batch):
-            window_logits.append(
-                _mask_logits(window_logits_batch[batch_index], allowed)
-            )
+            scanned_starts.append(batch_starts[batch_index])
+            window_logits.append(_mask_logits(window_logits_batch[batch_index], allowed))
             window_embeddings.append(window_embeddings_batch[batch_index])
             window_note_counts.append(len(indices))
             if len(indices):
@@ -283,6 +291,19 @@ def _scan_windows(
                 note_observations[indices] += 1
 
     # 曲全体の傾向は、ノートが多い窓ほど重く見る。
+    if not window_logits:
+        return _WindowScan(
+            starts=[],
+            window_logits=np.zeros(
+                (0, config.num_instrument_classes),
+                dtype=np.float64,
+            ),
+            window_note_counts=[],
+            global_logits=np.zeros(config.num_instrument_classes, dtype=np.float64),
+            note_logits=note_logit_sums,
+            note_embeddings=note_embedding_sums,
+        )
+
     stacked = np.stack(window_logits)
     weights = np.asarray(window_note_counts, dtype=np.float64) + 1.0
     global_logits = np.average(stacked, axis=0, weights=weights)
@@ -294,7 +315,7 @@ def _scan_windows(
         note_logits[missing] = global_logits
         note_embeddings[missing] = np.average(np.stack(window_embeddings), axis=0, weights=weights)
     return _WindowScan(
-        starts=starts,
+        starts=scanned_starts,
         window_logits=stacked,
         window_note_counts=window_note_counts,
         global_logits=global_logits,
@@ -499,6 +520,8 @@ def refine_midi_instruments(
     preloaded_model: InstrumentRefinementModel | None = None,
     preloaded_config: InstrumentRefinementConfig | None = None,
     preloaded_waveform: torch.Tensor | None = None,
+    amp: bool = False,
+    amp_dtype: str | torch.dtype | None = None,
 ) -> dict[str, Any]:
     """MIDI の楽器を、対応するステム音声から推論し直す。
 
@@ -515,6 +538,8 @@ def refine_midi_instruments(
         use_stem_mask: stem_name に基づく候補の絞り込みを行うか。
         preloaded_model/preloaded_config: 読み込み済みモデルを使い回す場合に両方渡す。
         preloaded_waveform: config.sample_rateへresample済みのCPU float32ステレオ波形。
+        amp: 窓ごとの backbone を autocast で走らせるか。CUDA / MPS でのみ有効。
+        amp_dtype: "fp16" / "bf16" / torch.dtype。省略時はデバイス既定を使う。
 
     Returns:
         予測結果とデバッグ情報を含む dict。output_json_path を渡すと同じ内容を保存する。
@@ -532,11 +557,15 @@ def refine_midi_instruments(
     if not audio_file.is_file() or not midi_file.is_file():
         raise FileNotFoundError("audio and MIDI paths must both exist")
     target_device = resolve_device(device)
+    amp_enabled = bool(amp and is_amp_supported(target_device))
+    resolved_amp_dtype = (
+        amp_dtype
+        if isinstance(amp_dtype, torch.dtype)
+        else resolve_amp_dtype(target_device, amp_dtype)
+    )
 
     # 1. モデルを用意する。ステムごとに呼ばれる用途では読み込み済みモデルを受け取る。
-    model, config = _resolve_model(
-        checkpoint_path, preloaded_model, preloaded_config, device=target_device
-    )
+    model, config = _resolve_model(checkpoint_path, preloaded_model, preloaded_config, device=target_device)
 
     # 2. 音声と MIDI を読み、楽器の候補集合を決める。
     if preloaded_waveform is None:
@@ -565,6 +594,8 @@ def refine_midi_instruments(
         window_batch_size=int(window_batch_size),
         device=target_device,
         disable_tqdm=disable_tqdm,
+        amp_enabled=amp_enabled,
+        amp_dtype=resolved_amp_dtype,
     )
 
     # 4. 音色埋め込みでノートをまとめる。single モードでは全ノートを 1 クラスタ扱い。

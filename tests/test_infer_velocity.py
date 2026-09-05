@@ -19,7 +19,7 @@ from instrument_agnostic_amt.velocity.modeling.model import (
     VelocityModelConfig,
     VelocityPredictionModel,
 )
-from instrument_agnostic_amt.velocity.training.dataset import STEM_CLASS_BY_NAME
+from instrument_agnostic_amt.velocity.stems import STEM_CLASS_BY_NAME
 
 
 def test_velocity_auto_routes_model_to_mps(
@@ -235,6 +235,40 @@ def test_predict_velocity_for_stem_midis(
         assert len(cc7_events) >= 1
         for cc in cc7_events:
             assert 1 <= cc.value <= 127
+
+
+def test_velocity_amp_keeps_predictions_in_midi_range(
+    mock_stem_midis: dict[str, Path],
+    mock_audio_stems: dict[str, Path],
+    mock_velocity_checkpoint: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """AMP経路でもvelocityがMIDIの整数域へ落ちることを確認する。
+
+    autocast下ではheadがbf16を返す。numpyはbf16を扱えないため、float32へ
+    戻さずに丸めると推論そのものが落ちる。CPUでもautocastは動くので、
+    is_amp_supportedだけを差し替えてAMP経路を通す。
+    """
+    monkeypatch.setattr(velocity_infer, "is_amp_supported", lambda device: True)
+    output_midi_path = tmp_path / "merged_velocity_amp.mid"
+
+    result_path = predict_velocity_for_stem_midis(
+        stem_midis=mock_stem_midis,
+        stem_audios=mock_audio_stems,
+        output_midi_path=output_midi_path,
+        checkpoint_path=mock_velocity_checkpoint,
+        device="cpu",
+        window_seconds=4.0,
+        disable_tqdm=True,
+        amp=True,
+        amp_dtype="bf16",
+    )
+
+    output_midi = pretty_midi.PrettyMIDI(str(result_path))
+    notes = [note for inst in output_midi.instruments for note in inst.notes]
+    assert notes
+    assert all(1 <= note.velocity <= 127 for note in notes)
 
 
 def test_velocity_compile_reuses_regional_forward_for_full_and_partial_windows(
