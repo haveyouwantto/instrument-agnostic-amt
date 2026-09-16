@@ -255,3 +255,9 @@ AGENTS.md
 colab_outputs/
 prepare_real_recordings.py
 run_refine_pipeline.py
+
+# Streaming server + frontend
+tsumugi-ui/node_modules/
+tsumugi-ui/dist/
+stream_outputs/
+_probe_work/
