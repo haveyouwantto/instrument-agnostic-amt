@@ -300,7 +300,7 @@ def get_stem_pipeline_models(
     if resolved_semi_crf_backend == "triton" and device.type != "cuda":
         raise ValueError("semi_crf_backend='triton' requires a CUDA device")
 
-    # 低显存模式：模型常驻 CPU 内存（RAM），仅在推理时搬运到 device。
+    # 低VRAMモード：モデルは CPU メモリ（RAM）に常駐させ、推論時だけ device へ移す。
     storage_device = torch.device("cpu") if low_vram_mode else device
 
     resolved_checkpoint = infer._ensure_checkpoint(
@@ -337,7 +337,7 @@ def get_stem_pipeline_models(
                     batch_size=int(stem_splitter_batch_size),
                 )
             else:
-                # 低显存モードでは分離を fp16 autocast で実行し、ピーク VRAM を抑える。
+                # 低VRAMモードでは分離を fp16 autocast で実行し、ピーク VRAM を抑える。
                 print("[LowVRAM] Separation uses fp16 autocast ...")
                 sep_config = SeparationConfig(
                     skip_existing=True,
@@ -451,7 +451,7 @@ def get_refinement_models(
     """Instrument Refinement モデルを読み込み、セッション中は再利用する。"""
     device = resolve_device(device_preference)
 
-    # 低显存模式：モデルは CPU に常駐させ、推論時だけ device へ移す。
+    # 低VRAMモード：モデルは CPU に常駐させ、推論時だけ device へ移す。
     storage_device = torch.device("cpu") if low_vram_mode else device
 
     resolved_checkpoint = ensure_refinement_checkpoint(checkpoint_path)
@@ -674,9 +674,8 @@ def run_stem_separated_transcription(
     """ステム分離 -> 各ステム採譜 -> 楽器再ラベリング -> MIDI マージ -> Velocity予測 -> Beat/Chord予測を一括実行する。
 
     low_vram_mode=True にすると、モデルをすべて CPU メモリに常駐させ、
-    各ステムの採譜を行う直前に対象 AMT モデルだけを GPU へ移動し、
-    終わったらすぐ CPU へ戻す。GPU に置かれるモデルは常に 1 つだけになる。
-
+    各ステムの採譜を行う直前に対象モデルだけを GPU へ移動し、終わったら
+    すぐ CPU へ戻す。GPU に置かれるモデルは常に 1 つだけになる。
     amp は AMT・楽器再ラベリング・Velocity の 3 段の backbone に共通で効く。
     どの段も窓ごとの backbone が支配項で、AMP の有無で 2〜3 割変わる。
     Beat/Chord だけは FP32 のままにしている。こちらは推論時間の大半が
@@ -956,7 +955,6 @@ def run_stem_separated_transcription(
     preloaded_velocity_waveforms: dict[str, torch.Tensor] | None = None
     if predict_velocity:
         velocity_model = None
-        velocity_config = None
         try:
             print("Predicting note velocities from separated stems...")
             stem_midis_map = {

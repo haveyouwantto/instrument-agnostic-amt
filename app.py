@@ -23,7 +23,10 @@ from pydantic import BaseModel
 import json
 from typing import Optional
 
-OUTPUT_ROOT = "U:"  # @param {type:"string"}
+OUTPUT_ROOT = "out"  # @param {type:"string"}
+WINDOW_BATCH_SIZE = 4  # @param {type:"integer"}
+MAX_MIDI_MELODIC_INSTRUMENTS = 15  # @param {type:"integer"}
+SKIP_DRUM_STEMS = True  # @param {type:"boolean"}
 CLEANUP_SEPARATED_STEMS = True  # @param {type:"boolean"}
 
 
