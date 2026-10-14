@@ -90,7 +90,9 @@ class StreamOptions:
 
     window_batch_size: int = 1
     max_midi_melodic_instruments: int = 15
-    merge_onset_ms: float = 50.0
+    # Kept in step with run_stem_separated_transcription's default (20.0 since
+    # the SheetSage2 beat grid landed).
+    merge_onset_ms: float = 20.0
     refine_instruments: bool = True
     refinement_stem_names: tuple[str, ...] = ("piano", "bass", "guitar")
     refinement_mode: str = "cluster"
